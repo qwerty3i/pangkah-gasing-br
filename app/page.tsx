@@ -128,6 +128,7 @@ export default function GasingBattleRoyale() {
     playerTrail: { x: number; y: number; alpha: number }[];
     lastTimestamp: number;
     accumulator: number;
+    deathParticles: { x: number; y: number; vx: number; vy: number; alpha: number; size: number; color: string }[];
   } | null>(null);
 
   const [displayRPM, setDisplayRPM] = useState(STARTING_RPM);
@@ -365,8 +366,9 @@ export default function GasingBattleRoyale() {
       frameCount: 0,
       playerAlive: true,
       playerTrail: [] as { x: number; y: number; alpha: number }[],
-      lastTimestamp: 0,       // for fixed timestep
-      accumulator: 0,         // time accumulator for fixed step
+      lastTimestamp: 0,
+      accumulator: 0,
+      deathParticles: [] as { x: number; y: number; vx: number; vy: number; alpha: number; size: number; color: string }[],
     };
     gameRef.current = game;
 
@@ -401,6 +403,22 @@ export default function GasingBattleRoyale() {
       const dx = body.position.x - game.safeZoneCX;
       const dy = body.position.y - game.safeZoneCY;
       return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    // Spawn death particles at a position
+    function spawnDeathParticles(x: number, y: number, color: string, count = 25) {
+      for (let i = 0; i < count; i++) {
+        const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+        const speed = 2 + Math.random() * 5;
+        game.deathParticles.push({
+          x, y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          alpha: 1,
+          size: 3 + Math.random() * 5,
+          color,
+        });
+      }
     }
 
     // ── Main game loop (fixed 60fps timestep) ──
@@ -531,6 +549,7 @@ export default function GasingBattleRoyale() {
           // Elimination check: RPM death OR flew out through a hole
           if (game.currentRPM <= 0 || dist2Center(player) > ARENA_R + 50) {
             game.playerAlive = false;
+            spawnDeathParticles(player.position.x, player.position.y, '#00ff88', 35);
             setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0 });
           }
         }
@@ -568,6 +587,7 @@ export default function GasingBattleRoyale() {
           // Elimination: RPM death OR flew out through a hole
           if (bot.rpm <= 0 || bDist > ARENA_R + 50) {
             bot.alive = false;
+            spawnDeathParticles(bot.body.position.x, bot.body.position.y, bot.color, 25);
             continue;
           }
 
@@ -1061,6 +1081,33 @@ export default function GasingBattleRoyale() {
         ctx.textAlign = 'center';
         ctx.fillText('YOU', player.position.x, player.position.y - PLAYER_R - 10);
       }
+
+      // ─── Death Particles ───
+      for (let i = game.deathParticles.length - 1; i >= 0; i--) {
+        const p = game.deathParticles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.08; // gravity
+        p.vx *= 0.98; // drag
+        p.alpha -= 0.015;
+        p.size *= 0.985;
+
+        if (p.alpha <= 0 || p.size < 0.5) {
+          game.deathParticles.splice(i, 1);
+          continue;
+        }
+
+        // Glow
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = p.color;
+        ctx.globalAlpha = p.alpha;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.shadowBlur = 0;
 
       game.animId = requestAnimationFrame(tick);
     };
