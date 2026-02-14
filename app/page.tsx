@@ -205,7 +205,10 @@ interface GameState {
   phase: 'menu' | 'playing' | 'paused' | 'gameover';
   isWinner: boolean;
   playersAlive: number;
+  kills: number;
 }
+
+type GameMode = 'battle-royale' | 'survival';
 
 // ─── Constants (TUNED FOR FUN!) ──────────────────────────────────
 const CANVAS_W = 1200;
@@ -275,6 +278,10 @@ const BOT_PASSIVE_REGEN = 10.0;       // RPM per second passive regen (inside sa
 const BOT_SEPARATION_RADIUS = 100;
 const BOT_SEPARATION_FORCE = 0.0015;
 
+// Survival mode
+const SURVIVAL_SPAWN_INTERVAL = 180; // frames between bot spawns (3 sec at 60fps)
+const SURVIVAL_SAFE_ZONE_SHRINK = 2;  // slower shrink in survival
+
 const BOT_COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
   '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#52B788',
@@ -291,7 +298,7 @@ const BOT_NAMES = [
 ];
 
 // ─── Component ───────────────────────────────────────────────────
-export default function GasingBattleRoyale() {
+export default function GasingIO() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gameRef = useRef<{
     engine: Matter.Engine;
@@ -312,6 +319,11 @@ export default function GasingBattleRoyale() {
     lastTimestamp: number;
     accumulator: number;
     deathParticles: { x: number; y: number; vx: number; vy: number; alpha: number; size: number; color: string }[];
+    gameMode: GameMode;
+    kills: number;
+    nextBotSpawnFrame: number;  // for survival mode
+    botSpawnIndex: number;      // which bot index to spawn next
+    wallBodies: Matter.Body[];  // reference to walls for spawning
   } | null>(null);
 
   const [displayRPM, setDisplayRPM] = useState(STARTING_RPM);
@@ -321,11 +333,15 @@ export default function GasingBattleRoyale() {
     phase: 'menu',
     isWinner: false,
     playersAlive: 11,
+    kills: 0,
   });
   const [displaySafeZone, setDisplaySafeZone] = useState(SAFE_ZONE_INITIAL);
   const isPausedRef = useRef(false);
   const cleanupRef = useRef<(() => void) | null>(null);
-  const [gameId, setGameId] = useState(0); // increments to trigger new game
+  const [gameId, setGameId] = useState(0);
+  const [gameMode, setGameMode] = useState<GameMode>('battle-royale');
+  const [displayKills, setDisplayKills] = useState(0);
+  const gameOverRef = useRef(false);
 
   // ─── Initialize game engine ─────────────────────────────────
   const initGame = useCallback(() => {
@@ -389,35 +405,38 @@ export default function GasingBattleRoyale() {
       label: 'player',
     });
 
-    // ── Bot bodies ──
+    // ── Bot bodies (Battle Royale: spawn all, Survival: spawn none) ──
     const bots: Bot[] = [];
-    for (let i = 0; i < botCount; i++) {
-      const angle = (i / botCount) * Math.PI * 2;
-      const dist = 180 + Math.random() * 80;
-      const x = CX + Math.cos(angle) * dist;
-      const y = CY + Math.sin(angle) * dist;
+    if (gameMode === 'battle-royale') {
+      for (let i = 0; i < botCount; i++) {
+        const angle = (i / botCount) * Math.PI * 2;
+        const dist = 180 + Math.random() * 80;
+        const x = CX + Math.cos(angle) * dist;
+        const y = CY + Math.sin(angle) * dist;
 
-      const body = Matter.Bodies.circle(x, y, BOT_R, {
-        frictionAir: FRICTION_AIR,
-        restitution: RESTITUTION,
-        density: DENSITY,
-        label: `bot_${i}`,
-      });
+        const body = Matter.Bodies.circle(x, y, BOT_R, {
+          frictionAir: FRICTION_AIR,
+          restitution: RESTITUTION,
+          density: DENSITY,
+          label: `bot_${i}`,
+        });
 
-      bots.push({
-        body,
-        rpm: 50 + Math.random() * 20,  // 50-70 starting RPM (solid start)
-        color: BOT_COLORS[i],
-        name: BOT_NAMES[i],
-        alive: true,
-        stateTimer: 0,
-        trail: [],
-        wanderAngle: Math.random() * Math.PI * 2,
-        personality: Math.random(),
-        lastHitFrame: -999,
-        chainHits: 0,
-      });
+        bots.push({
+          body,
+          rpm: 50 + Math.random() * 20,
+          color: BOT_COLORS[i % BOT_COLORS.length],
+          name: BOT_NAMES[i % BOT_NAMES.length],
+          alive: true,
+          stateTimer: 0,
+          trail: [],
+          wanderAngle: Math.random() * Math.PI * 2,
+          personality: Math.random(),
+          lastHitFrame: -999,
+          chainHits: 0,
+        });
+      }
     }
+    // Survival mode: bots array starts empty, they'll be spawned in the game loop
 
     Matter.World.add(engine.world, [
       ...wallBodies,
@@ -555,6 +574,11 @@ export default function GasingBattleRoyale() {
       lastTimestamp: 0,
       accumulator: 0,
       deathParticles: [] as { x: number; y: number; vx: number; vy: number; alpha: number; size: number; color: string }[],
+      gameMode,
+      kills: 0,
+      nextBotSpawnFrame: SURVIVAL_SPAWN_INTERVAL, // first bot spawns at 3 sec
+      botSpawnIndex: 0,
+      wallBodies,
     };
     gameRef.current = game;
 
@@ -612,14 +636,12 @@ export default function GasingBattleRoyale() {
     const FIXED_DT = 1000 / 60; // 16.667ms per physics step
 
     const tick = (timestamp: number) => {
-      if (!game.playerAlive && game.bots.every((b) => !b.alive)) {
-        game.animId = requestAnimationFrame(tick);
-        return;
-      }
+      // Stop physics when game is over (but still render for particles)
+      const isGameOver = gameOverRef.current;
 
       // Check pause
       if (isPausedRef.current) {
-        game.lastTimestamp = timestamp; // reset so we don't accumulate while paused
+        game.lastTimestamp = timestamp;
         game.animId = requestAnimationFrame(tick);
         return;
       }
@@ -638,8 +660,53 @@ export default function GasingBattleRoyale() {
       while (game.accumulator >= FIXED_DT) {
         game.accumulator -= FIXED_DT;
 
+        // Skip physics updates if game is over
+        if (isGameOver) continue;
+
         game.frameCount++;
         Matter.Engine.update(engine, FIXED_DT);
+
+        // ─── Survival Mode: Spawn bots from holes ───
+        if (game.gameMode === 'survival' && game.frameCount >= game.nextBotSpawnFrame && game.playerAlive) {
+          // No limit in survival — bots keep coming!
+          const idx = game.botSpawnIndex;
+          // Pick a random hole to spawn from
+          const holeAngle = HOLE_ANGLES[Math.floor(Math.random() * HOLE_ANGLES.length)];
+          const spawnDist = ARENA_R - 30; // just inside the wall at hole
+          const sx = CX + Math.cos(holeAngle) * spawnDist;
+          const sy = CY + Math.sin(holeAngle) * spawnDist;
+
+          const newBody = Matter.Bodies.circle(sx, sy, BOT_R, {
+            frictionAir: FRICTION_AIR,
+            restitution: RESTITUTION,
+            density: DENSITY,
+            label: `bot_${idx}`,
+          });
+
+          // Give initial velocity toward center
+          const toCenter = { x: (CX - sx) * 0.01, y: (CY - sy) * 0.01 };
+          Matter.Body.setVelocity(newBody, toCenter);
+
+          const newBot: Bot = {
+            body: newBody,
+            rpm: 55 + Math.random() * 15,
+            color: BOT_COLORS[idx % BOT_COLORS.length],
+            name: BOT_NAMES[idx % BOT_NAMES.length],
+            alive: true,
+            stateTimer: 0,
+            trail: [],
+            wanderAngle: Math.random() * Math.PI * 2,
+            personality: Math.random(),
+            lastHitFrame: -999,
+            chainHits: 0,
+          };
+
+          game.bots.push(newBot);
+          Matter.World.add(engine.world, newBody);
+
+          game.botSpawnIndex++;
+          game.nextBotSpawnFrame = game.frameCount + SURVIVAL_SPAWN_INTERVAL;
+        }
 
         // ─── Center gravity — BOWL SHAPE (quadratic: stronger toward edges) ───
         const allBodies = [player, ...bots.filter(b => b.alive).map(b => b.body)];
@@ -739,13 +806,16 @@ export default function GasingBattleRoyale() {
             spawnDeathParticles(player.position.x, player.position.y, '#00ff88', 35);
             soundManager.playDeath();
             soundManager.playGameOver(false);
-            setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0 });
+            gameOverRef.current = true;
+            setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0, kills: game.kills });
           }
         }
 
         // ─── Safe zone shrink + drift ───
+        // Safe zone shrink (slower in survival)
+        const shrinkRate = game.gameMode === 'survival' ? SURVIVAL_SAFE_ZONE_SHRINK : SAFE_ZONE_SHRINK_PER_SEC;
         if (game.frameCount % 60 === 0 && game.safeZone > SAFE_ZONE_MIN) {
-          game.safeZone = Math.max(SAFE_ZONE_MIN, game.safeZone - SAFE_ZONE_SHRINK_PER_SEC);
+          game.safeZone = Math.max(SAFE_ZONE_MIN, game.safeZone - shrinkRate);
           setDisplaySafeZone(game.safeZone);
         }
         // Drift safe zone center toward random target
@@ -778,6 +848,8 @@ export default function GasingBattleRoyale() {
             bot.alive = false;
             spawnDeathParticles(bot.body.position.x, bot.body.position.y, bot.color, 25);
             soundManager.playDeath();
+            game.kills++;
+            setDisplayKills(game.kills);
             continue;
           }
 
@@ -932,7 +1004,7 @@ export default function GasingBattleRoyale() {
               .filter((o) => o !== bot && o.alive && o.rpm + MIN_RPM_ADVANTAGE < bot.rpm)
               .map((o) => {
                 const odx = o.body.position.x - bot.body.position.x;
-                const ody = o.body.position.y - bot.body.position.y;
+                const ody = o.body.position.y - o.body.position.y;
                 return { bot: o, dist: Math.sqrt(odx * odx + ody * ody) };
               })
               .filter((o) => o.dist < 200)
@@ -1012,11 +1084,18 @@ export default function GasingBattleRoyale() {
         const totalAlive = aliveCount + (game.playerAlive ? 1 : 0);
         setGameState((prev) => {
           if (prev.phase !== 'playing') return prev;
-          if (aliveCount === 0 && game.playerAlive) {
+          if (game.gameMode === 'battle-royale' && aliveCount === 0 && game.playerAlive) {
             soundManager.playGameOver(true);
-            return { phase: 'gameover', isWinner: true, playersAlive: 1 };
+            gameOverRef.current = true;
+            return { phase: 'gameover', isWinner: true, playersAlive: 1, kills: game.kills };
           }
-          return { ...prev, playersAlive: totalAlive };
+          // In survival mode, player wins if they survive for a certain time or clear all bots (if MAX_BOTS is reached)
+          // For now, survival mode win condition is just "don't die"
+          if (game.gameMode === 'survival' && !game.playerAlive) {
+            soundManager.playGameOver(false);
+            return { phase: 'gameover', isWinner: false, playersAlive: 0, kills: game.kills };
+          }
+          return { ...prev, playersAlive: totalAlive, kills: game.kills };
         });
         setDisplayRPM(game.currentRPM);
         // Update stopwatch every second
@@ -1314,7 +1393,7 @@ export default function GasingBattleRoyale() {
       Matter.Engine.clear(engine);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [botCount]);
+  }, [botCount, gameMode]);
 
   // ─── Start game ──────────────────────────────────────────────
   const startGame = useCallback(() => {
@@ -1324,13 +1403,16 @@ export default function GasingBattleRoyale() {
       cleanupRef.current = null;
     }
     gameRef.current = null;
-    setGameState({ phase: 'playing', isWinner: false, playersAlive: botCount + 1 });
+    const initialAlive = gameMode === 'battle-royale' ? botCount + 1 : 1; // Only player is alive initially in survival
+    setGameState({ phase: 'playing', isWinner: false, playersAlive: initialAlive, kills: 0 });
     setDisplayRPM(STARTING_RPM);
     setDisplaySafeZone(SAFE_ZONE_INITIAL);
     setDisplayTimer(0);
+    setDisplayKills(0);
     isPausedRef.current = false;
-    setGameId(prev => prev + 1); // triggers the init useEffect
-  }, [botCount]);
+    gameOverRef.current = false;
+    setGameId(prev => prev + 1);
+  }, [botCount, gameMode]);
 
   // Run engine when gameId changes (new game started)
   useEffect(() => {
@@ -1415,6 +1497,7 @@ export default function GasingBattleRoyale() {
 
   const restartGame = () => {
     isPausedRef.current = false;
+    gameOverRef.current = false;
     soundManager.stopBGM();
     if (cleanupRef.current) {
       cleanupRef.current();
@@ -1424,7 +1507,7 @@ export default function GasingBattleRoyale() {
       gameRef.current = null;
     }
     setGameId(0);
-    setGameState({ phase: 'menu', isWinner: false, playersAlive: botCount + 1 });
+    setGameState({ phase: 'menu', isWinner: false, playersAlive: botCount + 1, kills: 0 });
   };
 
   const togglePause = () => {
@@ -1491,13 +1574,24 @@ export default function GasingBattleRoyale() {
               </div>
             </div>
 
-            {/* Alive counter */}
+            {/* Alive counter / Survival stats */}
             <div className="absolute top-4 right-4 pointer-events-none">
               <div className="bg-black/80 backdrop-blur rounded-lg p-4" style={{ border: '1px solid rgba(234, 179, 8, 0.3)' }}>
-                <div className="text-gray-400 text-xs font-bold tracking-widest mb-1">ALIVE</div>
-                <div className="text-4xl font-bold text-yellow-400 font-mono">
-                  {gameState.playersAlive}<span className="text-lg text-gray-500">/{botCount + 1}</span>
-                </div>
+                {gameMode === 'survival' ? (
+                  <>
+                    <div className="text-gray-400 text-xs font-bold tracking-widest mb-1">KILLS</div>
+                    <div className="text-4xl font-bold text-red-400 font-mono">
+                      {displayKills}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-gray-400 text-xs font-bold tracking-widest mb-1">ALIVE</div>
+                    <div className="text-4xl font-bold text-yellow-400 font-mono">
+                      {gameState.playersAlive}<span className="text-lg text-gray-500">/{botCount + 1}</span>
+                    </div>
+                  </>
+                )}
               </div>
             </div>
 
@@ -1571,14 +1665,32 @@ export default function GasingBattleRoyale() {
         {gameState.phase === 'menu' && (
           <div className="absolute inset-0 flex items-center justify-center rounded-xl" style={{ background: 'rgba(0,0,0,0.85)' }}>
             <div className="text-center max-w-xl px-8">
-              <h1 className="text-7xl font-black mb-2" style={{
-                background: 'linear-gradient(135deg, #f7dc6f, #ff6b6b, #bb8fce)',
-                WebkitBackgroundClip: 'text',
-                WebkitTextFillColor: 'transparent',
-              }}>
-                PANGKAH
+              <h1 className="text-7xl font-black bg-gradient-to-r from-purple-400 via-pink-400 to-yellow-400 bg-clip-text text-transparent mb-2">
+                GASING.IO
               </h1>
-              <p className="text-2xl text-purple-300 font-semibold mb-10">Gasing Battle Royale</p>
+              <p className="text-2xl text-purple-300 font-semibold mb-8">Choose Your Mode</p>
+
+              {/* Mode Selection */}
+              <div className="flex gap-4 mb-8">
+                <button
+                  onClick={() => setGameMode('battle-royale')}
+                  className={`flex-1 rounded-xl p-5 text-left transition-all hover:scale-[1.02] ${gameMode === 'battle-royale' ? 'ring-2 ring-purple-400 bg-purple-900/40' : 'bg-white/5 hover:bg-white/10'
+                    }`}
+                >
+                  <div className="text-2xl mb-1">⚔️</div>
+                  <div className="text-white font-bold text-lg">Battle Royale</div>
+                  <div className="text-gray-400 text-xs mt-1">Last gasing standing wins! All bots spawn at once.</div>
+                </button>
+                <button
+                  onClick={() => setGameMode('survival')}
+                  className={`flex-1 rounded-xl p-5 text-left transition-all hover:scale-[1.02] ${gameMode === 'survival' ? 'ring-2 ring-red-400 bg-red-900/40' : 'bg-white/5 hover:bg-white/10'
+                    }`}
+                >
+                  <div className="text-2xl mb-1">🛡️</div>
+                  <div className="text-white font-bold text-lg">Survival</div>
+                  <div className="text-gray-400 text-xs mt-1">Bots enter one by one from holes. Survive as long as you can!</div>
+                </button>
+              </div>
 
               <div className="bg-white/5 rounded-xl p-6 mb-8 text-left space-y-3">
                 <h2 className="text-lg font-bold text-yellow-400 mb-3">🎮 How to Play</h2>
@@ -1618,43 +1730,51 @@ export default function GasingBattleRoyale() {
                 </div>
               </div>
 
-              {/* Bot count selector */}
-              <div className="bg-white/5 rounded-xl p-4 mb-8">
-                <div className="text-sm font-bold text-purple-300 mb-3">⚙️ Settings</div>
-                <div className="flex items-center justify-between">
-                  <span className="text-gray-300 text-sm">AI Opponents</span>
-                  <div className="flex items-center gap-3">
-                    <button
-                      onClick={() => setBotCount(Math.max(1, botCount - 1))}
-                      className="w-8 h-8 rounded-lg bg-gray-700 text-white font-bold hover:bg-gray-600 transition-colors"
-                    >
-                      −
-                    </button>
-                    <span className="text-2xl font-bold text-yellow-400 font-mono w-8 text-center">{botCount}</span>
-                    <button
-                      onClick={() => setBotCount(Math.min(MAX_BOTS, botCount + 1))}
-                      className="w-8 h-8 rounded-lg bg-gray-700 text-white font-bold hover:bg-gray-600 transition-colors"
-                    >
-                      +
-                    </button>
+              {/* Bot count selector (Battle Royale only) */}
+              {gameMode === 'battle-royale' && (
+                <div className="bg-white/5 rounded-xl p-4 mb-8">
+                  <div className="text-sm font-bold text-purple-300 mb-3">⚙️ Settings</div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-300 text-sm">AI Opponents</span>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={() => setBotCount(Math.max(1, botCount - 1))}
+                        className="w-8 h-8 rounded-lg bg-gray-700 text-white font-bold hover:bg-gray-600 transition-colors"
+                      >
+                        −
+                      </button>
+                      <span className="text-2xl font-bold text-yellow-400 font-mono w-8 text-center">{botCount}</span>
+                      <button
+                        onClick={() => setBotCount(Math.min(MAX_BOTS, botCount + 1))}
+                        className="w-8 h-8 rounded-lg bg-gray-700 text-white font-bold hover:bg-gray-600 transition-colors"
+                      >
+                        +
+                      </button>
+                    </div>
                   </div>
+                  <div className="text-gray-600 text-[10px] mt-1 text-right">1 – {MAX_BOTS} opponents</div>
                 </div>
-                <div className="text-gray-600 text-[10px] mt-1 text-right">1 – {MAX_BOTS} opponents</div>
-              </div>
+              )}
 
               <button
                 onClick={startGame}
                 className="px-14 py-4 rounded-full text-white font-bold text-xl transition-all hover:scale-105 active:scale-95"
                 style={{
-                  background: 'linear-gradient(135deg, #7c3aed, #ec4899)',
-                  boxShadow: '0 0 30px rgba(124, 58, 237, 0.4)',
+                  background: gameMode === 'survival'
+                    ? 'linear-gradient(135deg, #e74c3c, #f39c12)'
+                    : 'linear-gradient(135deg, #7c3aed, #ec4899)',
+                  boxShadow: gameMode === 'survival'
+                    ? '0 0 30px rgba(231, 76, 60, 0.4)'
+                    : '0 0 30px rgba(124, 58, 237, 0.4)',
                 }}
               >
-                🌀 START BATTLE 🌀
+                {gameMode === 'survival' ? '🛡️ START SURVIVAL 🛡️' : '🌀 START BATTLE 🌀'}
               </button>
 
               <p className="text-gray-600 text-xs mt-4">
-                Battle against {botCount} AI opponent{botCount !== 1 ? 's' : ''} in a shrinking arena
+                {gameMode === 'survival'
+                  ? 'Survive endless waves of bots entering from the holes!'
+                  : `Battle against ${botCount} AI opponent${botCount !== 1 ? 's' : ''} in a shrinking arena`}
               </p>
             </div>
           </div>
@@ -1667,11 +1787,29 @@ export default function GasingBattleRoyale() {
               <h1 className={`text-6xl font-black mb-3 ${gameState.isWinner ? 'text-yellow-400' : 'text-red-500'}`}>
                 {gameState.isWinner ? '🏆 VICTORY! 🏆' : '💀 KNOCKED OUT 💀'}
               </h1>
-              <p className="text-gray-300 text-xl mb-8">
-                {gameState.isWinner
-                  ? 'You are the last Gasing standing!'
-                  : 'Your Gasing stopped spinning...'}
-              </p>
+              {gameMode === 'survival' ? (
+                <div className="mb-8">
+                  <p className="text-gray-300 text-xl mb-4">Your gasing stopped spinning...</p>
+                  <div className="flex gap-6 justify-center">
+                    <div className="bg-white/10 rounded-xl p-4">
+                      <div className="text-red-400 text-3xl font-bold font-mono">{gameState.kills}</div>
+                      <div className="text-gray-500 text-xs font-bold tracking-widest">KILLS</div>
+                    </div>
+                    <div className="bg-white/10 rounded-xl p-4">
+                      <div className="text-cyan-400 text-3xl font-bold font-mono">
+                        {String(Math.floor(displayTimer / 60)).padStart(2, '0')}:{String(displayTimer % 60).padStart(2, '0')}
+                      </div>
+                      <div className="text-gray-500 text-xs font-bold tracking-widest">TIME</div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-gray-300 text-xl mb-8">
+                  {gameState.isWinner
+                    ? 'You are the last Gasing standing!'
+                    : 'Your Gasing stopped spinning...'}
+                </p>
+              )}
               <button
                 onClick={restartGame}
                 className="px-12 py-4 rounded-full text-white font-bold text-xl transition-all hover:scale-105 active:scale-95"
