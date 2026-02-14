@@ -126,6 +126,8 @@ export default function GasingBattleRoyale() {
     frameCount: number;
     playerAlive: boolean;
     playerTrail: { x: number; y: number; alpha: number }[];
+    lastTimestamp: number;
+    accumulator: number;
   } | null>(null);
 
   const [displayRPM, setDisplayRPM] = useState(STARTING_RPM);
@@ -363,6 +365,8 @@ export default function GasingBattleRoyale() {
       frameCount: 0,
       playerAlive: true,
       playerTrail: [] as { x: number; y: number; alpha: number }[],
+      lastTimestamp: 0,       // for fixed timestep
+      accumulator: 0,         // time accumulator for fixed step
     };
     gameRef.current = game;
 
@@ -399,8 +403,10 @@ export default function GasingBattleRoyale() {
       return Math.sqrt(dx * dx + dy * dy);
     }
 
-    // ── Main game loop ──
-    const tick = () => {
+    // ── Main game loop (fixed 60fps timestep) ──
+    const FIXED_DT = 1000 / 60; // 16.667ms per physics step
+
+    const tick = (timestamp: number) => {
       if (!game.playerAlive && game.bots.every((b) => !b.alive)) {
         game.animId = requestAnimationFrame(tick);
         return;
@@ -408,391 +414,408 @@ export default function GasingBattleRoyale() {
 
       // Check pause
       if (isPausedRef.current) {
+        game.lastTimestamp = timestamp; // reset so we don't accumulate while paused
         game.animId = requestAnimationFrame(tick);
         return;
       }
 
-      game.frameCount++;
-      Matter.Engine.update(engine, 1000 / 60);
+      // Calculate elapsed time since last frame
+      if (game.lastTimestamp === 0) game.lastTimestamp = timestamp;
+      let elapsed = timestamp - game.lastTimestamp;
+      game.lastTimestamp = timestamp;
 
-      // ─── Center gravity — BOWL SHAPE (quadratic: stronger toward edges) ───
-      const allBodies = [player, ...bots.filter(b => b.alive).map(b => b.body)];
-      for (const body of allBodies) {
-        const gdx = CX - body.position.x;
-        const gdy = CY - body.position.y;
-        const gd = Math.sqrt(gdx * gdx + gdy * gdy);
-        if (gd > 5) {
-          // Force scales with distance² — like rolling down a bowl
-          const gForce = CENTER_GRAVITY * gd;
-          Matter.Body.applyForce(body, body.position, {
-            x: (gdx / gd) * gForce,
-            y: (gdy / gd) * gForce,
-          });
-        }
-      }
+      // Clamp to prevent spiral of death (e.g. tab was hidden)
+      if (elapsed > 200) elapsed = 200;
 
-      // ─── Dynamic friction based on RPM ───
-      // Low RPM = sticky (hard to move), Over-spin = ice (can't stop)
-      function rpmToFriction(rpm: number): number {
-        if (rpm < SWEET_LOW) {
-          // Wobble zone: very sticky, scales from 0.10 (rpm=0) to 0.03 (rpm=40)
-          return 0.10 - (rpm / SWEET_LOW) * 0.07;
-        } else if (rpm <= SWEET_HIGH) {
-          // Sweet spot: normal friction
-          return 0.025;
-        } else {
-          // Over-spin: friction drops dramatically toward 0
-          const overFactor = (rpm - SWEET_HIGH) / (100 - SWEET_HIGH); // 0 to 1
-          return 0.025 - overFactor * 0.022; // 0.025 down to 0.003
-        }
-      }
+      game.accumulator += elapsed;
 
-      // Update player friction
-      if (game.playerAlive) {
-        player.frictionAir = rpmToFriction(game.currentRPM);
-      }
-      // Update bot friction
-      for (const bot of game.bots) {
-        if (!bot.alive) continue;
-        bot.body.frictionAir = rpmToFriction(bot.rpm);
-      }
+      // Run physics in fixed steps of ~16.67ms (60fps)
+      while (game.accumulator >= FIXED_DT) {
+        game.accumulator -= FIXED_DT;
 
-      // ─── Player movement ───
-      if (game.playerAlive) {
-        let mf = PLAYER_MOVE_FORCE;
+        game.frameCount++;
+        Matter.Engine.update(engine, FIXED_DT);
 
-        // RPM affects movement force
-        if (game.currentRPM < SWEET_LOW) {
-          // Wobble: sluggish — hard to get moving
-          mf *= 0.4;
-        } else if (game.currentRPM >= SWEET_LOW && game.currentRPM <= SWEET_HIGH) {
-          // Sweet spot: balanced, responsive
-          mf *= 1.1;
-        } else {
-          // Over-spin: VERY reactive — launches you!
-          const overFactor = (game.currentRPM - SWEET_HIGH) / (100 - SWEET_HIGH);
-          mf *= 1.5 + overFactor * 0.8; // up to 2.3x force
-        }
-
-        // Over-spin: erratic shaking (energy vibration)
-        if (game.currentRPM > SWEET_HIGH) {
-          const intensity = (game.currentRPM - SWEET_HIGH) / (100 - SWEET_HIGH);
-          const shake = 0.0015 + intensity * 0.003;
-          Matter.Body.applyForce(player, player.position, {
-            x: (Math.random() - 0.5) * shake,
-            y: (Math.random() - 0.5) * shake,
-          });
-        }
-
-        const pDist = distToSafeZone(player);
-        const pOutside = pDist > game.safeZone;
-        const dragMult = pOutside ? OUTSIDE_DRAG_MULT : 1.0;
-
-        if (game.keys.has('w'))
-          Matter.Body.applyForce(player, player.position, { x: 0, y: -mf * dragMult });
-        if (game.keys.has('s'))
-          Matter.Body.applyForce(player, player.position, { x: 0, y: mf * dragMult });
-        if (game.keys.has('a'))
-          Matter.Body.applyForce(player, player.position, { x: -mf * dragMult, y: 0 });
-        if (game.keys.has('d'))
-          Matter.Body.applyForce(player, player.position, { x: mf * dragMult, y: 0 });
-
-        // RPM decay — much harsher outside zone
-        let decay = RPM_DECAY_PER_FRAME;
-        if (pOutside) decay *= OUTSIDE_DECAY_MULT;
-        game.currentRPM = Math.max(0, game.currentRPM - decay);
-
-        // Trail
-        game.playerTrail.push({ x: player.position.x, y: player.position.y, alpha: 1 });
-        if (game.playerTrail.length > 20) game.playerTrail.shift();
-        game.playerTrail.forEach((t) => (t.alpha -= 0.05));
-
-        // Elimination check: RPM death OR flew out through a hole
-        if (game.currentRPM <= 0 || dist2Center(player) > ARENA_R + 50) {
-          game.playerAlive = false;
-          setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0 });
-        }
-      }
-
-      // ─── Safe zone shrink + drift ───
-      if (game.frameCount % 60 === 0 && game.safeZone > SAFE_ZONE_MIN) {
-        game.safeZone = Math.max(SAFE_ZONE_MIN, game.safeZone - SAFE_ZONE_SHRINK_PER_SEC);
-        setDisplaySafeZone(game.safeZone);
-      }
-      // Drift safe zone center toward random target
-      const szDx = game.szTargetX - game.safeZoneCX;
-      const szDy = game.szTargetY - game.safeZoneCY;
-      const szDist = Math.sqrt(szDx * szDx + szDy * szDy);
-      if (szDist > 5) {
-        game.safeZoneCX += (szDx / szDist) * SAFE_ZONE_DRIFT_SPEED;
-        game.safeZoneCY += (szDy / szDist) * SAFE_ZONE_DRIFT_SPEED;
-      } else {
-        // Reached target — pick a new random target within arena bounds
-        // Keep safe zone center reasonable distance from edges
-        const maxDrift = Math.max(50, ARENA_R - game.safeZone - 40);
-        const angle = Math.random() * Math.PI * 2;
-        const drift = Math.random() * maxDrift;
-        game.szTargetX = CX + Math.cos(angle) * drift;
-        game.szTargetY = CY + Math.sin(angle) * drift;
-      }
-
-      // ─── Bot AI ───
-      let aliveCount = 0;
-      for (const bot of game.bots) {
-        if (!bot.alive) continue;
-
-        const bDist = dist2Center(bot.body);   // distance from arena center (for elimination)
-        const bDistSz = distToSafeZone(bot.body); // distance from safe zone center (for RPM penalty)
-
-        // Elimination: RPM death OR flew out through a hole
-        if (bot.rpm <= 0 || bDist > ARENA_R + 50) {
-          bot.alive = false;
-          continue;
-        }
-
-        aliveCount++;
-
-        // Bot RPM management
-        const bOutside = bDistSz > game.safeZone;
-        let botDecay = RPM_DECAY_PER_FRAME * 0.35;
-        if (bOutside) botDecay *= OUTSIDE_DECAY_MULT;
-        bot.rpm = Math.max(0, bot.rpm - botDecay);
-
-        // Passive regen inside safe zone (1 RPM/sec)
-        if (!bOutside) {
-          bot.rpm = Math.min(90, bot.rpm + BOT_PASSIVE_REGEN / 60);
-        }
-
-        // RPM floor inside safe zone
-        if (!bOutside && bot.rpm < BOT_RPM_FLOOR_INSIDE) {
-          bot.rpm = BOT_RPM_FLOOR_INSIDE;
-        }
-
-        // Reset chain if no hits for 2 seconds
-        if (game.frameCount - bot.lastHitFrame > BOT_CHAIN_WINDOW) {
-          bot.chainHits = 0;
-        }
-
-        // Regular spinning
-        if (Math.random() < BOT_SPIN_CHANCE) {
-          const gain = bOutside ? BOT_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_SPIN_GAIN;
-          bot.rpm = Math.min(90, bot.rpm + gain);
-        }
-
-        // EMERGENCY SPIN: when RPM is critically low, bots panic-spin extra hard
-        if (bot.rpm < SWEET_LOW && Math.random() < BOT_EMERGENCY_SPIN_CHANCE) {
-          const eGain = bOutside ? BOT_EMERGENCY_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_EMERGENCY_SPIN_GAIN;
-          bot.rpm = Math.min(90, bot.rpm + eGain);
-        }
-
-        bot.stateTimer++;
-        // Slowly drift wander angle for organic movement
-        bot.wanderAngle += (Math.random() - 0.5) * 0.3;
-
-        // ── SEPARATION FORCE (anti-clumping!) ──
-        let sepX = 0;
-        let sepY = 0;
-        for (const other of game.bots) {
-          if (other === bot || !other.alive) continue;
-          const sdx = bot.body.position.x - other.body.position.x;
-          const sdy = bot.body.position.y - other.body.position.y;
-          const sDist = Math.sqrt(sdx * sdx + sdy * sdy);
-          if (sDist < BOT_SEPARATION_RADIUS && sDist > 0) {
-            // Inverse-distance push: closer = stronger repulsion
-            const strength = (BOT_SEPARATION_RADIUS - sDist) / BOT_SEPARATION_RADIUS;
-            sepX += (sdx / sDist) * strength;
-            sepY += (sdy / sDist) * strength;
+        // ─── Center gravity — BOWL SHAPE (quadratic: stronger toward edges) ───
+        const allBodies = [player, ...bots.filter(b => b.alive).map(b => b.body)];
+        for (const body of allBodies) {
+          const gdx = CX - body.position.x;
+          const gdy = CY - body.position.y;
+          const gd = Math.sqrt(gdx * gdx + gdy * gdy);
+          if (gd > 5) {
+            // Force scales with distance² — like rolling down a bowl
+            const gForce = CENTER_GRAVITY * gd;
+            Matter.Body.applyForce(body, body.position, {
+              x: (gdx / gd) * gForce,
+              y: (gdy / gd) * gForce,
+            });
           }
         }
-        // Apply separation
-        const sepLen = Math.sqrt(sepX * sepX + sepY * sepY);
-        if (sepLen > 0) {
-          Matter.Body.applyForce(bot.body, bot.body.position, {
-            x: (sepX / sepLen) * BOT_SEPARATION_FORCE,
-            y: (sepY / sepLen) * BOT_SEPARATION_FORCE,
-          });
+
+        // ─── Dynamic friction based on RPM ───
+        // Low RPM = sticky (hard to move), Over-spin = ice (can't stop)
+        function rpmToFriction(rpm: number): number {
+          if (rpm < SWEET_LOW) {
+            // Wobble zone: very sticky, scales from 0.10 (rpm=0) to 0.03 (rpm=40)
+            return 0.10 - (rpm / SWEET_LOW) * 0.07;
+          } else if (rpm <= SWEET_HIGH) {
+            // Sweet spot: normal friction
+            return 0.025;
+          } else {
+            // Over-spin: friction drops dramatically toward 0
+            const overFactor = (rpm - SWEET_HIGH) / (100 - SWEET_HIGH); // 0 to 1
+            return 0.025 - overFactor * 0.022; // 0.025 down to 0.003
+          }
         }
 
-        // ── DANGER AVOIDANCE (dodge stronger enemies + holes) ──
-        let dodgeX = 0;
-        let dodgeY = 0;
+        // Update player friction
+        if (game.playerAlive) {
+          player.frictionAir = rpmToFriction(game.currentRPM);
+        }
+        // Update bot friction
+        for (const bot of game.bots) {
+          if (!bot.alive) continue;
+          bot.body.frictionAir = rpmToFriction(bot.rpm);
+        }
 
-        // Avoid stronger enemies
-        for (const other of game.bots) {
-          if (other === bot || !other.alive) continue;
-          if (other.rpm > bot.rpm + 5) { // enemy is stronger
-            const ddx = bot.body.position.x - other.body.position.x;
-            const ddy = bot.body.position.y - other.body.position.y;
-            const dd = Math.sqrt(ddx * ddx + ddy * ddy);
-            if (dd < 120) {
-              const urgency = (120 - dd) / 120;
-              dodgeX += (ddx / dd) * urgency * 2;
-              dodgeY += (ddy / dd) * urgency * 2;
+        // ─── Player movement ───
+        if (game.playerAlive) {
+          let mf = PLAYER_MOVE_FORCE;
+
+          // RPM affects movement force
+          if (game.currentRPM < SWEET_LOW) {
+            // Wobble: sluggish — hard to get moving
+            mf *= 0.4;
+          } else if (game.currentRPM >= SWEET_LOW && game.currentRPM <= SWEET_HIGH) {
+            // Sweet spot: balanced, responsive
+            mf *= 1.1;
+          } else {
+            // Over-spin: VERY reactive — launches you!
+            const overFactor = (game.currentRPM - SWEET_HIGH) / (100 - SWEET_HIGH);
+            mf *= 1.5 + overFactor * 0.8; // up to 2.3x force
+          }
+
+          // Over-spin: erratic shaking (energy vibration)
+          if (game.currentRPM > SWEET_HIGH) {
+            const intensity = (game.currentRPM - SWEET_HIGH) / (100 - SWEET_HIGH);
+            const shake = 0.0015 + intensity * 0.003;
+            Matter.Body.applyForce(player, player.position, {
+              x: (Math.random() - 0.5) * shake,
+              y: (Math.random() - 0.5) * shake,
+            });
+          }
+
+          const pDist = distToSafeZone(player);
+          const pOutside = pDist > game.safeZone;
+          const dragMult = pOutside ? OUTSIDE_DRAG_MULT : 1.0;
+
+          if (game.keys.has('w'))
+            Matter.Body.applyForce(player, player.position, { x: 0, y: -mf * dragMult });
+          if (game.keys.has('s'))
+            Matter.Body.applyForce(player, player.position, { x: 0, y: mf * dragMult });
+          if (game.keys.has('a'))
+            Matter.Body.applyForce(player, player.position, { x: -mf * dragMult, y: 0 });
+          if (game.keys.has('d'))
+            Matter.Body.applyForce(player, player.position, { x: mf * dragMult, y: 0 });
+
+          // RPM decay — much harsher outside zone
+          let decay = RPM_DECAY_PER_FRAME;
+          if (pOutside) decay *= OUTSIDE_DECAY_MULT;
+          game.currentRPM = Math.max(0, game.currentRPM - decay);
+
+          // Trail
+          game.playerTrail.push({ x: player.position.x, y: player.position.y, alpha: 1 });
+          if (game.playerTrail.length > 20) game.playerTrail.shift();
+          game.playerTrail.forEach((t) => (t.alpha -= 0.05));
+
+          // Elimination check: RPM death OR flew out through a hole
+          if (game.currentRPM <= 0 || dist2Center(player) > ARENA_R + 50) {
+            game.playerAlive = false;
+            setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0 });
+          }
+        }
+
+        // ─── Safe zone shrink + drift ───
+        if (game.frameCount % 60 === 0 && game.safeZone > SAFE_ZONE_MIN) {
+          game.safeZone = Math.max(SAFE_ZONE_MIN, game.safeZone - SAFE_ZONE_SHRINK_PER_SEC);
+          setDisplaySafeZone(game.safeZone);
+        }
+        // Drift safe zone center toward random target
+        const szDx = game.szTargetX - game.safeZoneCX;
+        const szDy = game.szTargetY - game.safeZoneCY;
+        const szDist = Math.sqrt(szDx * szDx + szDy * szDy);
+        if (szDist > 5) {
+          game.safeZoneCX += (szDx / szDist) * SAFE_ZONE_DRIFT_SPEED;
+          game.safeZoneCY += (szDy / szDist) * SAFE_ZONE_DRIFT_SPEED;
+        } else {
+          // Reached target — pick a new random target within arena bounds
+          // Keep safe zone center reasonable distance from edges
+          const maxDrift = Math.max(50, ARENA_R - game.safeZone - 40);
+          const angle = Math.random() * Math.PI * 2;
+          const drift = Math.random() * maxDrift;
+          game.szTargetX = CX + Math.cos(angle) * drift;
+          game.szTargetY = CY + Math.sin(angle) * drift;
+        }
+
+        // ─── Bot AI ───
+        let aliveCount = 0;
+        for (const bot of game.bots) {
+          if (!bot.alive) continue;
+
+          const bDist = dist2Center(bot.body);   // distance from arena center (for elimination)
+          const bDistSz = distToSafeZone(bot.body); // distance from safe zone center (for RPM penalty)
+
+          // Elimination: RPM death OR flew out through a hole
+          if (bot.rpm <= 0 || bDist > ARENA_R + 50) {
+            bot.alive = false;
+            continue;
+          }
+
+          aliveCount++;
+
+          // Bot RPM management
+          const bOutside = bDistSz > game.safeZone;
+          let botDecay = RPM_DECAY_PER_FRAME * 0.35;
+          if (bOutside) botDecay *= OUTSIDE_DECAY_MULT;
+          bot.rpm = Math.max(0, bot.rpm - botDecay);
+
+          // Passive regen inside safe zone (1 RPM/sec)
+          if (!bOutside) {
+            bot.rpm = Math.min(90, bot.rpm + BOT_PASSIVE_REGEN / 60);
+          }
+
+          // RPM floor inside safe zone
+          if (!bOutside && bot.rpm < BOT_RPM_FLOOR_INSIDE) {
+            bot.rpm = BOT_RPM_FLOOR_INSIDE;
+          }
+
+          // Reset chain if no hits for 2 seconds
+          if (game.frameCount - bot.lastHitFrame > BOT_CHAIN_WINDOW) {
+            bot.chainHits = 0;
+          }
+
+          // Regular spinning
+          if (Math.random() < BOT_SPIN_CHANCE) {
+            const gain = bOutside ? BOT_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_SPIN_GAIN;
+            bot.rpm = Math.min(90, bot.rpm + gain);
+          }
+
+          // EMERGENCY SPIN: when RPM is critically low, bots panic-spin extra hard
+          if (bot.rpm < SWEET_LOW && Math.random() < BOT_EMERGENCY_SPIN_CHANCE) {
+            const eGain = bOutside ? BOT_EMERGENCY_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_EMERGENCY_SPIN_GAIN;
+            bot.rpm = Math.min(90, bot.rpm + eGain);
+          }
+
+          bot.stateTimer++;
+          // Slowly drift wander angle for organic movement
+          bot.wanderAngle += (Math.random() - 0.5) * 0.3;
+
+          // ── SEPARATION FORCE (anti-clumping!) ──
+          let sepX = 0;
+          let sepY = 0;
+          for (const other of game.bots) {
+            if (other === bot || !other.alive) continue;
+            const sdx = bot.body.position.x - other.body.position.x;
+            const sdy = bot.body.position.y - other.body.position.y;
+            const sDist = Math.sqrt(sdx * sdx + sdy * sdy);
+            if (sDist < BOT_SEPARATION_RADIUS && sDist > 0) {
+              // Inverse-distance push: closer = stronger repulsion
+              const strength = (BOT_SEPARATION_RADIUS - sDist) / BOT_SEPARATION_RADIUS;
+              sepX += (sdx / sDist) * strength;
+              sepY += (sdy / sDist) * strength;
             }
           }
-        }
-        // Avoid stronger player
-        if (game.playerAlive && game.currentRPM > bot.rpm + 5) {
-          const ddx = bot.body.position.x - player.position.x;
-          const ddy = bot.body.position.y - player.position.y;
-          const dd = Math.sqrt(ddx * ddx + ddy * ddy);
-          if (dd < 140) {
-            const urgency = (140 - dd) / 140;
-            dodgeX += (ddx / dd) * urgency * 3; // extra caution around player
-            dodgeY += (ddy / dd) * urgency * 3;
+          // Apply separation
+          const sepLen = Math.sqrt(sepX * sepX + sepY * sepY);
+          if (sepLen > 0) {
+            Matter.Body.applyForce(bot.body, bot.body.position, {
+              x: (sepX / sepLen) * BOT_SEPARATION_FORCE,
+              y: (sepY / sepLen) * BOT_SEPARATION_FORCE,
+            });
           }
-        }
-        // Avoid holes
-        for (const ha of HOLE_ANGLES) {
-          const hx = CX + Math.cos(ha) * ARENA_R;
-          const hy = CY + Math.sin(ha) * ARENA_R;
-          const hdx = bot.body.position.x - hx;
-          const hdy = bot.body.position.y - hy;
-          const hdist = Math.sqrt(hdx * hdx + hdy * hdy);
-          if (hdist < 100) {
-            const urgency = (100 - hdist) / 100;
-            dodgeX += (hdx / hdist) * urgency * 2.5;
-            dodgeY += (hdy / hdist) * urgency * 2.5;
-          }
-        }
 
-        // ── AI Decision Making ──
-        const bf = BOT_MOVE_FORCE;
-        const dodgeLen = Math.sqrt(dodgeX * dodgeX + dodgeY * dodgeY);
-        const isDodging = dodgeLen > 0.5; // significant dodge needed
+          // ── DANGER AVOIDANCE (dodge stronger enemies + holes) ──
+          let dodgeX = 0;
+          let dodgeY = 0;
 
-        if (isDodging) {
-          // DODGE MODE: Evade danger first!
-          Matter.Body.applyForce(bot.body, bot.body.position, {
-            x: (dodgeX / dodgeLen) * bf * 1.5,
-            y: (dodgeY / dodgeLen) * bf * 1.5,
-          });
-        } else if (bOutside || bDistSz > game.safeZone * 0.85) {
-          // SURVIVAL: Rush toward safe zone center (not arena center!)
-          const dx = game.safeZoneCX - bot.body.position.x;
-          const dy = game.safeZoneCY - bot.body.position.y;
-          const d = Math.sqrt(dx * dx + dy * dy) || 1;
-          Matter.Body.applyForce(bot.body, bot.body.position, {
-            x: (dx / d) * bf * 1.8,
-            y: (dy / d) * bf * 1.8,
-          });
-        } else if (bot.rpm > SWEET_LOW + 5) {
-          // CHASE: Only attack when we have a CLEAR RPM advantage (10+ RPM)
-          let bestTarget: Matter.Body | null = null;
-          let bestScore = -Infinity;
-          const MIN_RPM_ADVANTAGE = 10; // must be 10+ RPM ahead to attack
-
-          // Consider player
-          if (game.playerAlive && game.currentRPM + MIN_RPM_ADVANTAGE < bot.rpm) {
-            const pdx = player.position.x - bot.body.position.x;
-            const pdy = player.position.y - bot.body.position.y;
-            const pDist = Math.sqrt(pdx * pdx + pdy * pdy);
-            if (pDist < 200) {
-              const score = (bot.rpm - game.currentRPM) / (pDist + 1) * 100 * (0.5 + bot.personality);
-              if (score > bestScore) {
-                bestScore = score;
-                bestTarget = player;
+          // Avoid stronger enemies
+          for (const other of game.bots) {
+            if (other === bot || !other.alive) continue;
+            if (other.rpm > bot.rpm + 5) { // enemy is stronger
+              const ddx = bot.body.position.x - other.body.position.x;
+              const ddy = bot.body.position.y - other.body.position.y;
+              const dd = Math.sqrt(ddx * ddx + ddy * ddy);
+              if (dd < 120) {
+                const urgency = (120 - dd) / 120;
+                dodgeX += (ddx / dd) * urgency * 2;
+                dodgeY += (ddy / dd) * urgency * 2;
               }
             }
           }
-
-          // Consider other bots — only those significantly weaker
-          const otherBots = game.bots
-            .filter((o) => o !== bot && o.alive && o.rpm + MIN_RPM_ADVANTAGE < bot.rpm)
-            .map((o) => {
-              const odx = o.body.position.x - bot.body.position.x;
-              const ody = o.body.position.y - bot.body.position.y;
-              return { bot: o, dist: Math.sqrt(odx * odx + ody * ody) };
-            })
-            .filter((o) => o.dist < 200)
-            .sort((a, b) => a.dist - b.dist)
-            .slice(0, 2);
-
-          for (const { bot: other, dist: oDist } of otherBots) {
-            const score = (bot.rpm - other.rpm) / (oDist + 1) * 100;
-            if (score > bestScore) {
-              bestScore = score;
-              bestTarget = other.body;
+          // Avoid stronger player
+          if (game.playerAlive && game.currentRPM > bot.rpm + 5) {
+            const ddx = bot.body.position.x - player.position.x;
+            const ddy = bot.body.position.y - player.position.y;
+            const dd = Math.sqrt(ddx * ddx + ddy * ddy);
+            if (dd < 140) {
+              const urgency = (140 - dd) / 140;
+              dodgeX += (ddx / dd) * urgency * 3; // extra caution around player
+              dodgeY += (ddy / dd) * urgency * 3;
+            }
+          }
+          // Avoid holes
+          for (const ha of HOLE_ANGLES) {
+            const hx = CX + Math.cos(ha) * ARENA_R;
+            const hy = CY + Math.sin(ha) * ARENA_R;
+            const hdx = bot.body.position.x - hx;
+            const hdy = bot.body.position.y - hy;
+            const hdist = Math.sqrt(hdx * hdx + hdy * hdy);
+            if (hdist < 100) {
+              const urgency = (100 - hdist) / 100;
+              dodgeX += (hdx / hdist) * urgency * 2.5;
+              dodgeY += (hdy / hdist) * urgency * 2.5;
             }
           }
 
-          if (bestTarget) {
-            const dx = bestTarget.position.x - bot.body.position.x;
-            const dy = bestTarget.position.y - bot.body.position.y;
-            const d = Math.sqrt(dx * dx + dy * dy) || 1;
-            // Flanking approach — not head-on
-            const perpX = -dy / d;
-            const perpY = dx / d;
-            const flankOffset = Math.sin(game.frameCount * 0.03 + bot.wanderAngle) * 0.35;
+          // ── AI Decision Making ──
+          const bf = BOT_MOVE_FORCE;
+          const dodgeLen = Math.sqrt(dodgeX * dodgeX + dodgeY * dodgeY);
+          const isDodging = dodgeLen > 0.5; // significant dodge needed
+
+          if (isDodging) {
+            // DODGE MODE: Evade danger first!
             Matter.Body.applyForce(bot.body, bot.body.position, {
-              x: (dx / d + perpX * flankOffset) * bf,
-              y: (dy / d + perpY * flankOffset) * bf,
+              x: (dodgeX / dodgeLen) * bf * 1.5,
+              y: (dodgeY / dodgeLen) * bf * 1.5,
             });
+          } else if (bOutside || bDistSz > game.safeZone * 0.85) {
+            // SURVIVAL: Rush toward safe zone center (not arena center!)
+            const dx = game.safeZoneCX - bot.body.position.x;
+            const dy = game.safeZoneCY - bot.body.position.y;
+            const d = Math.sqrt(dx * dx + dy * dy) || 1;
+            Matter.Body.applyForce(bot.body, bot.body.position, {
+              x: (dx / d) * bf * 1.8,
+              y: (dy / d) * bf * 1.8,
+            });
+          } else if (bot.rpm > SWEET_LOW + 5) {
+            // CHASE: Only attack when we have a CLEAR RPM advantage (10+ RPM)
+            let bestTarget: Matter.Body | null = null;
+            let bestScore = -Infinity;
+            const MIN_RPM_ADVANTAGE = 10; // must be 10+ RPM ahead to attack
+
+            // Consider player
+            if (game.playerAlive && game.currentRPM + MIN_RPM_ADVANTAGE < bot.rpm) {
+              const pdx = player.position.x - bot.body.position.x;
+              const pdy = player.position.y - bot.body.position.y;
+              const pDist = Math.sqrt(pdx * pdx + pdy * pdy);
+              if (pDist < 200) {
+                const score = (bot.rpm - game.currentRPM) / (pDist + 1) * 100 * (0.5 + bot.personality);
+                if (score > bestScore) {
+                  bestScore = score;
+                  bestTarget = player;
+                }
+              }
+            }
+
+            // Consider other bots — only those significantly weaker
+            const otherBots = game.bots
+              .filter((o) => o !== bot && o.alive && o.rpm + MIN_RPM_ADVANTAGE < bot.rpm)
+              .map((o) => {
+                const odx = o.body.position.x - bot.body.position.x;
+                const ody = o.body.position.y - bot.body.position.y;
+                return { bot: o, dist: Math.sqrt(odx * odx + ody * ody) };
+              })
+              .filter((o) => o.dist < 200)
+              .sort((a, b) => a.dist - b.dist)
+              .slice(0, 2);
+
+            for (const { bot: other, dist: oDist } of otherBots) {
+              const score = (bot.rpm - other.rpm) / (oDist + 1) * 100;
+              if (score > bestScore) {
+                bestScore = score;
+                bestTarget = other.body;
+              }
+            }
+
+            if (bestTarget) {
+              const dx = bestTarget.position.x - bot.body.position.x;
+              const dy = bestTarget.position.y - bot.body.position.y;
+              const d = Math.sqrt(dx * dx + dy * dy) || 1;
+              // Flanking approach — not head-on
+              const perpX = -dy / d;
+              const perpY = dx / d;
+              const flankOffset = Math.sin(game.frameCount * 0.03 + bot.wanderAngle) * 0.35;
+              Matter.Body.applyForce(bot.body, bot.body.position, {
+                x: (dx / d + perpX * flankOffset) * bf,
+                y: (dy / d + perpY * flankOffset) * bf,
+              });
+            } else {
+              // WANDER — unique per bot using wanderAngle
+              const wx = CX + Math.cos(bot.wanderAngle) * 150 - bot.body.position.x;
+              const wy = CY + Math.sin(bot.wanderAngle) * 150 - bot.body.position.y;
+              const wd = Math.sqrt(wx * wx + wy * wy) || 1;
+              Matter.Body.applyForce(bot.body, bot.body.position, {
+                x: (wx / wd) * bf * 0.6,
+                y: (wy / wd) * bf * 0.6,
+              });
+            }
           } else {
-            // WANDER — unique per bot using wanderAngle
-            const wx = CX + Math.cos(bot.wanderAngle) * 150 - bot.body.position.x;
-            const wy = CY + Math.sin(bot.wanderAngle) * 150 - bot.body.position.y;
-            const wd = Math.sqrt(wx * wx + wy * wy) || 1;
+            // LOW RPM: Flee from ALL threats, prioritize survival
+            let fleeX = 0;
+            let fleeY = 0;
+            for (const other of game.bots) {
+              if (other === bot || !other.alive) continue;
+              const dx = bot.body.position.x - other.body.position.x;
+              const dy = bot.body.position.y - other.body.position.y;
+              const d = Math.sqrt(dx * dx + dy * dy) || 1;
+              if (d < 180) {
+                fleeX += (dx / d) * (180 - d) / 180;
+                fleeY += (dy / d) * (180 - d) / 180;
+              }
+            }
+            if (game.playerAlive) {
+              const dx = bot.body.position.x - player.position.x;
+              const dy = bot.body.position.y - player.position.y;
+              const d = Math.sqrt(dx * dx + dy * dy) || 1;
+              if (d < 180) {
+                fleeX += (dx / d) * (180 - d) / 180;
+                fleeY += (dy / d) * (180 - d) / 180;
+              }
+            }
+            // Bias flee toward safe zone center so they don't flee outside
+            fleeX += (game.safeZoneCX - bot.body.position.x) * 0.008;
+            fleeY += (game.safeZoneCY - bot.body.position.y) * 0.008;
+            const fd = Math.sqrt(fleeX * fleeX + fleeY * fleeY) || 1;
             Matter.Body.applyForce(bot.body, bot.body.position, {
-              x: (wx / wd) * bf * 0.6,
-              y: (wy / wd) * bf * 0.6,
+              x: (fleeX / fd) * bf * 0.9,
+              y: (fleeY / fd) * bf * 0.9,
             });
           }
-        } else {
-          // LOW RPM: Flee from ALL threats, prioritize survival
-          let fleeX = 0;
-          let fleeY = 0;
-          for (const other of game.bots) {
-            if (other === bot || !other.alive) continue;
-            const dx = bot.body.position.x - other.body.position.x;
-            const dy = bot.body.position.y - other.body.position.y;
-            const d = Math.sqrt(dx * dx + dy * dy) || 1;
-            if (d < 180) {
-              fleeX += (dx / d) * (180 - d) / 180;
-              fleeY += (dy / d) * (180 - d) / 180;
-            }
-          }
-          if (game.playerAlive) {
-            const dx = bot.body.position.x - player.position.x;
-            const dy = bot.body.position.y - player.position.y;
-            const d = Math.sqrt(dx * dx + dy * dy) || 1;
-            if (d < 180) {
-              fleeX += (dx / d) * (180 - d) / 180;
-              fleeY += (dy / d) * (180 - d) / 180;
-            }
-          }
-          // Bias flee toward safe zone center so they don't flee outside
-          fleeX += (game.safeZoneCX - bot.body.position.x) * 0.008;
-          fleeY += (game.safeZoneCY - bot.body.position.y) * 0.008;
-          const fd = Math.sqrt(fleeX * fleeX + fleeY * fleeY) || 1;
-          Matter.Body.applyForce(bot.body, bot.body.position, {
-            x: (fleeX / fd) * bf * 0.9,
-            y: (fleeY / fd) * bf * 0.9,
-          });
+
+          // Trail
+          bot.trail.push({ x: bot.body.position.x, y: bot.body.position.y, alpha: 1 });
+          if (bot.trail.length > 12) bot.trail.shift();
+          bot.trail.forEach((t) => (t.alpha -= 0.08));
         }
 
-        // Trail
-        bot.trail.push({ x: bot.body.position.x, y: bot.body.position.y, alpha: 1 });
-        if (bot.trail.length > 12) bot.trail.shift();
-        bot.trail.forEach((t) => (t.alpha -= 0.08));
-      }
-
-      // Update alive count
-      const totalAlive = aliveCount + (game.playerAlive ? 1 : 0);
-      setGameState((prev) => {
-        if (prev.phase !== 'playing') return prev;
-        if (aliveCount === 0 && game.playerAlive) {
-          return { phase: 'gameover', isWinner: true, playersAlive: 1 };
+        // Update alive count
+        const totalAlive = aliveCount + (game.playerAlive ? 1 : 0);
+        setGameState((prev) => {
+          if (prev.phase !== 'playing') return prev;
+          if (aliveCount === 0 && game.playerAlive) {
+            return { phase: 'gameover', isWinner: true, playersAlive: 1 };
+          }
+          return { ...prev, playersAlive: totalAlive };
+        });
+        setDisplayRPM(game.currentRPM);
+        // Update stopwatch every second
+        if (game.frameCount % 60 === 0) {
+          setDisplayTimer(Math.floor(game.frameCount / 60));
         }
-        return { ...prev, playersAlive: totalAlive };
-      });
-      setDisplayRPM(game.currentRPM);
-      // Update stopwatch every second
-      if (game.frameCount % 60 === 0) {
-        setDisplayTimer(Math.floor(game.frameCount / 60));
-      }
 
-      // ─── Render ───
+      } // end fixed timestep while loop
+
+      // ─── Render (runs at native refresh rate for smooth visuals) ───
       // Background
       ctx.fillStyle = '#0f0f1a';
       ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
