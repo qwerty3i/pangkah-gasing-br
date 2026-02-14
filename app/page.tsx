@@ -3,6 +3,189 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Matter from 'matter-js';
 
+// ─── Sound Manager (procedural Web Audio API) ────────────────
+class SoundManager {
+  private ctx: AudioContext | null = null;
+  private bgmGain: GainNode | null = null;
+  private bgmPlaying = false;
+  private bgmInterval: ReturnType<typeof setInterval> | null = null;
+
+  private getCtx(): AudioContext {
+    if (!this.ctx) this.ctx = new AudioContext();
+    return this.ctx;
+  }
+
+  playCollision(intensity = 0.5) {
+    const ctx = this.getCtx();
+    const t = ctx.currentTime;
+    // Short noise burst for impact
+    const bufferSize = ctx.sampleRate * 0.08;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * (1 - i / bufferSize);
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(800 + intensity * 1200, t);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.15 * intensity, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+    source.connect(filter).connect(gain).connect(ctx.destination);
+    source.start(t);
+    source.stop(t + 0.08);
+  }
+
+  playDeath() {
+    const ctx = this.getCtx();
+    const t = ctx.currentTime;
+    // Descending tone + noise burst
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(600, t);
+    osc.frequency.exponentialRampToValueAtTime(80, t + 0.3);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.15, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.3);
+    // Pop noise
+    const bufferSize = ctx.sampleRate * 0.15;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) {
+      data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / bufferSize, 2);
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.2, t);
+    g2.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+    src.connect(g2).connect(ctx.destination);
+    src.start(t);
+    src.stop(t + 0.15);
+  }
+
+  playSpin() {
+    const ctx = this.getCtx();
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1200 + Math.random() * 400, t);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.04, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t);
+    osc.stop(t + 0.03);
+  }
+
+  playGameOver(isWinner: boolean) {
+    const ctx = this.getCtx();
+    const t = ctx.currentTime;
+    if (isWinner) {
+      // Ascending triumphant notes
+      [0, 0.12, 0.24, 0.4].forEach((offset, i) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime([523, 659, 784, 1047][i], t + offset);
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.12, t + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + offset + 0.25);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t + offset);
+        osc.stop(t + offset + 0.25);
+      });
+    } else {
+      // Descending sad notes
+      [0, 0.15, 0.3].forEach((offset, i) => {
+        const osc = ctx.createOscillator();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime([400, 300, 200][i], t + offset);
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.1, t + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + offset + 0.3);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(t + offset);
+        osc.stop(t + offset + 0.3);
+      });
+    }
+  }
+
+  startBGM() {
+    if (this.bgmPlaying) return;
+    const ctx = this.getCtx();
+    this.bgmGain = ctx.createGain();
+    this.bgmGain.gain.value = 0.06;
+    this.bgmGain.connect(ctx.destination);
+    this.bgmPlaying = true;
+
+    const notes = [130.81, 146.83, 164.81, 174.61, 196.00, 220.00, 246.94, 261.63];
+    let beatIndex = 0;
+
+    const playBeat = () => {
+      if (!this.bgmPlaying || !this.bgmGain) return;
+      const t = ctx.currentTime;
+
+      // Bass note
+      const bass = ctx.createOscillator();
+      bass.type = 'triangle';
+      bass.frequency.setValueAtTime(notes[beatIndex % notes.length], t);
+      const bassGain = ctx.createGain();
+      bassGain.gain.setValueAtTime(0.15, t);
+      bassGain.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
+      bass.connect(bassGain).connect(this.bgmGain!);
+      bass.start(t);
+      bass.stop(t + 0.3);
+
+      // Hi-hat (noise tick)
+      if (beatIndex % 2 === 0) {
+        const bufSize = ctx.sampleRate * 0.03;
+        const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < bufSize; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / bufSize);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const hpf = ctx.createBiquadFilter();
+        hpf.type = 'highpass';
+        hpf.frequency.value = 6000;
+        const hg = ctx.createGain();
+        hg.gain.setValueAtTime(0.08, t);
+        hg.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+        src.connect(hpf).connect(hg).connect(this.bgmGain!);
+        src.start(t);
+        src.stop(t + 0.03);
+      }
+
+      beatIndex++;
+    };
+
+    playBeat();
+    this.bgmInterval = setInterval(playBeat, 400);
+  }
+
+  stopBGM() {
+    this.bgmPlaying = false;
+    if (this.bgmInterval) {
+      clearInterval(this.bgmInterval);
+      this.bgmInterval = null;
+    }
+    if (this.bgmGain) {
+      this.bgmGain.gain.value = 0;
+      this.bgmGain = null;
+    }
+  }
+
+  resume() {
+    if (this.ctx?.state === 'suspended') this.ctx.resume();
+  }
+}
+
+const soundManager = new SoundManager();
+
 // ─── Types ───────────────────────────────────────────────────────
 interface Bot {
   body: Matter.Body;
@@ -141,6 +324,8 @@ export default function GasingBattleRoyale() {
   });
   const [displaySafeZone, setDisplaySafeZone] = useState(SAFE_ZONE_INITIAL);
   const isPausedRef = useRef(false);
+  const cleanupRef = useRef<(() => void) | null>(null);
+  const [gameId, setGameId] = useState(0); // increments to trigger new game
 
   // ─── Initialize game engine ─────────────────────────────────
   const initGame = useCallback(() => {
@@ -322,6 +507,7 @@ export default function GasingBattleRoyale() {
           x: nx * force,
           y: ny * force,
         });
+        soundManager.playCollision(Math.min(1, force * 5));
 
         // ── RPM drain — FLAT 5% + CHAIN BONUS ──
         if (defender.label === 'player') {
@@ -379,6 +565,7 @@ export default function GasingBattleRoyale() {
 
       if ((k === 'j' || k === 'k') && game.playerAlive) {
         if (game.lastSpinKey !== k) {
+          soundManager.playSpin();
           const playerDist = distToSafeZone(game.player);
           const outside = playerDist > game.safeZone;
           const gain = outside ? RPM_GAIN_PER_PRESS * OUTSIDE_GAIN_MULT : RPM_GAIN_PER_PRESS;
@@ -550,6 +737,8 @@ export default function GasingBattleRoyale() {
           if (game.currentRPM <= 0 || dist2Center(player) > ARENA_R + 50) {
             game.playerAlive = false;
             spawnDeathParticles(player.position.x, player.position.y, '#00ff88', 35);
+            soundManager.playDeath();
+            soundManager.playGameOver(false);
             setGameState({ phase: 'gameover', isWinner: false, playersAlive: 0 });
           }
         }
@@ -588,6 +777,7 @@ export default function GasingBattleRoyale() {
           if (bot.rpm <= 0 || bDist > ARENA_R + 50) {
             bot.alive = false;
             spawnDeathParticles(bot.body.position.x, bot.body.position.y, bot.color, 25);
+            soundManager.playDeath();
             continue;
           }
 
@@ -823,6 +1013,7 @@ export default function GasingBattleRoyale() {
         setGameState((prev) => {
           if (prev.phase !== 'playing') return prev;
           if (aliveCount === 0 && game.playerAlive) {
+            soundManager.playGameOver(true);
             return { phase: 'gameover', isWinner: true, playersAlive: 1 };
           }
           return { ...prev, playersAlive: totalAlive };
@@ -1127,19 +1318,34 @@ export default function GasingBattleRoyale() {
 
   // ─── Start game ──────────────────────────────────────────────
   const startGame = useCallback(() => {
+    // Clean up any existing game first
+    if (cleanupRef.current) {
+      cleanupRef.current();
+      cleanupRef.current = null;
+    }
+    gameRef.current = null;
     setGameState({ phase: 'playing', isWinner: false, playersAlive: botCount + 1 });
     setDisplayRPM(STARTING_RPM);
     setDisplaySafeZone(SAFE_ZONE_INITIAL);
     setDisplayTimer(0);
     isPausedRef.current = false;
+    setGameId(prev => prev + 1); // triggers the init useEffect
   }, [botCount]);
 
-  // Run engine when phase changes to playing
+  // Run engine when gameId changes (new game started)
   useEffect(() => {
-    if (gameState.phase !== 'playing') return;
+    if (gameId === 0) return; // no game started yet
     const cleanup = initGame();
-    return cleanup;
-  }, [gameState.phase, initGame]);
+    cleanupRef.current = cleanup ?? null;
+    soundManager.resume();
+    soundManager.startBGM();
+    // Only destroy engine on component unmount, NOT on pause
+    return () => {
+      if (cleanup) cleanup();
+      cleanupRef.current = null;
+      soundManager.stopBGM();
+    };
+  }, [gameId, initGame]);
 
   // Escape key for pause
   useEffect(() => {
@@ -1209,12 +1415,15 @@ export default function GasingBattleRoyale() {
 
   const restartGame = () => {
     isPausedRef.current = false;
+    soundManager.stopBGM();
+    if (cleanupRef.current) {
+      cleanupRef.current();
+      cleanupRef.current = null;
+    }
     if (gameRef.current) {
-      cancelAnimationFrame(gameRef.current.animId);
-      Matter.World.clear(gameRef.current.engine.world, false);
-      Matter.Engine.clear(gameRef.current.engine);
       gameRef.current = null;
     }
+    setGameId(0);
     setGameState({ phase: 'menu', isWinner: false, playersAlive: botCount + 1 });
   };
 
