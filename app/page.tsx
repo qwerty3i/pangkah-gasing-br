@@ -310,7 +310,7 @@ const DUEL_BOMB_EXPLODE_R = 60;       // explosion radius
 const DUEL_BOMB_DMG = 12;             // RPM damage from bomb
 const DUEL_LASER_DMG = 4;             // RPM damage from laser (reduced)
 const DUEL_COLLISION_MULT = 3;        // collision damage multiplier in duel
-const DUEL_SAFE_ZONE_SHRINK = 4;      // slower shrink for boss fight
+const DUEL_SAFE_ZONE_SHRINK = 2;      // slower shrink for boss fight
 const DUEL_ROUND_TRANSITION_FRAMES = 180; // 3 seconds at 60fps
 const DUEL_PROJECTILE_INVULN = 20;    // invincibility frames after projectile hit (0.33 sec)
 const DUEL_BOSS_SPIN_CHANCE = 0.05;   // boss spins much slower (5% vs 30%)
@@ -1026,6 +1026,17 @@ export default function GasingIO() {
           // RPM floor inside safe zone (disabled for duel boss)
           if (!bOutside && bot.rpm < BOT_RPM_FLOOR_INSIDE && game.gameMode !== 'duel') {
             bot.rpm = BOT_RPM_FLOOR_INSIDE;
+          }
+
+          // Duel boss: slow HP regen inside safe zone, moderate HP drain outside
+          if (game.gameMode === 'duel') {
+            if (bOutside) {
+              // Lose HP outside safe zone
+              game.duelBossHP = Math.max(0, game.duelBossHP - 3);
+            } else {
+              // Slow regen inside safe zone (~3 HP/sec)
+              game.duelBossHP = Math.min(game.duelBossMaxHP, game.duelBossHP + 0.05);
+            }
           }
 
           // Reset chain if no hits for 2 seconds
