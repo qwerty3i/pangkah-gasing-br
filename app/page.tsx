@@ -298,7 +298,9 @@ const SURVIVAL_SAFE_ZONE_SHRINK = 2;  // slower shrink in survival
 
 // Duel mode
 const BOSS_R = 28;                    // boss is bigger
-const BOSS_RPM = 1000;                  // boss starting RPM (tankier)
+const BOSS_RPM = 65;                  // boss RPM for physics (NOT health)
+const BOSS_HP = 500;                  // boss health pool (separate from RPM)
+const BOSS_HP_PER_ROUND = 100;        // extra HP each round
 const BOSS_COLOR = '#ff2266';         // boss color
 const DUEL_LASER_SPEED = 8;           // pixels per frame
 const DUEL_LASER_INTERVAL = 12;       // frames between lasers (5/sec)
@@ -363,6 +365,8 @@ export default function GasingIO() {
     lastLaserFrame: number;
     lastBombFrame: number;
     duelBossMaxRPM: number;
+    duelBossHP: number;           // separate HP pool for boss
+    duelBossMaxHP: number;        // max HP for current round
     duelTransition: boolean;      // true during round transition
     duelTransitionTimer: number;  // countdown frames
     lastProjectileHitFrame: number; // for invincibility after projectile hit
@@ -385,7 +389,8 @@ export default function GasingIO() {
   const [displayKills, setDisplayKills] = useState(0);
   const gameOverRef = useRef(false);
   const [duelRound, setDuelRound] = useState(1);
-  const [bossRPM, setBossRPM] = useState(BOSS_RPM);
+  const [bossHP, setBossHP] = useState(BOSS_HP);
+  const [bossMaxHP, setBossMaxHP] = useState(BOSS_HP);
 
   // ─── Initialize game engine ─────────────────────────────────
   const initGame = useCallback(() => {
@@ -618,14 +623,17 @@ export default function GasingIO() {
             // Drain = 5 base + 5 per chain level
             let chainDrain = 5 + (defBot.chainHits - 1) * 5;
 
-            // Duel mode: momentum damage — faster player hits = more damage to boss
+            // Duel mode: momentum damage — faster player hits = more damage to boss HP pool
             if (g.gameMode === 'duel' && attacker.label === 'player') {
               const playerSpeed = Math.sqrt(attacker.velocity.x ** 2 + attacker.velocity.y ** 2);
-              const momentumBonus = playerSpeed * 2; // ~0-10 extra RPM drain based on speed
+              const momentumBonus = playerSpeed * 2;
               chainDrain += momentumBonus;
+              // Drain boss HP instead of RPM
+              g.duelBossHP = Math.max(0, g.duelBossHP - chainDrain);
+              setBossHP(g.duelBossHP);
+            } else {
+              defBot.rpm = Math.max(0, defBot.rpm - chainDrain);
             }
-
-            defBot.rpm = Math.max(0, defBot.rpm - chainDrain);
           }
         }
       }
@@ -663,6 +671,8 @@ export default function GasingIO() {
       lastLaserFrame: 0,
       lastBombFrame: 0,
       duelBossMaxRPM: BOSS_RPM,
+      duelBossHP: BOSS_HP,
+      duelBossMaxHP: BOSS_HP,
       duelTransition: false,
       duelTransitionTimer: 0,
       lastProjectileHitFrame: -999,  // for invincibility frames
@@ -942,7 +952,9 @@ export default function GasingIO() {
           const bDistSz = distToSafeZone(bot.body); // distance from safe zone center (for RPM penalty)
 
           // Elimination: RPM death OR flew out through a hole
-          if (bot.rpm <= 0 || bDist > ARENA_R + 50) {
+          // Duel boss: check HP pool instead of RPM
+          const bossDead = game.gameMode === 'duel' ? game.duelBossHP <= 0 : bot.rpm <= 0;
+          if (bossDead || bDist > ARENA_R + 50) {
             bot.alive = false;
             spawnDeathParticles(bot.body.position.x, bot.body.position.y, bot.color, 25);
             soundManager.playDeath();
@@ -960,9 +972,13 @@ export default function GasingIO() {
 
                 // Reset boss
                 bot.alive = true;
-                bot.rpm = BOSS_RPM + game.duelRound * 15; // boss gets significantly stronger
-                game.duelBossMaxRPM = bot.rpm;
-                setBossRPM(bot.rpm);
+                bot.rpm = BOSS_RPM; // physics RPM stays constant
+                game.duelBossMaxRPM = BOSS_RPM;
+                const roundHP = BOSS_HP + game.duelRound * BOSS_HP_PER_ROUND;
+                game.duelBossHP = roundHP;
+                game.duelBossMaxHP = roundHP;
+                setBossHP(roundHP);
+                setBossMaxHP(roundHP);
                 Matter.Body.setPosition(bot.body, { x: CX + 200, y: CY });
                 Matter.Body.setVelocity(bot.body, { x: 0, y: 0 });
 
@@ -1227,7 +1243,7 @@ export default function GasingIO() {
         if (game.gameMode === 'duel' && game.playerAlive) {
           const boss = game.bots[0];
           if (boss && boss.alive) {
-            setBossRPM(boss.rpm);
+            setBossHP(game.duelBossHP);
 
             // Round 2+: Fire laser toward player
             if (game.duelRound >= 2 && game.frameCount - game.lastLaserFrame >= DUEL_LASER_INTERVAL) {
@@ -1636,7 +1652,7 @@ export default function GasingIO() {
           const hpH = 5;
           const hpX = boss.body.position.x - hpW / 2;
           const hpY = boss.body.position.y - BOSS_R - 22;
-          const hpPct = boss.rpm / game.duelBossMaxRPM;
+          const hpPct = game.duelBossHP / game.duelBossMaxHP;
           ctx.fillStyle = 'rgba(0,0,0,0.6)';
           ctx.fillRect(hpX, hpY, hpW, hpH);
           ctx.fillStyle = hpPct > 0.5 ? '#ff2266' : hpPct > 0.25 ? '#ff8800' : '#ff0000';
@@ -1813,7 +1829,8 @@ export default function GasingIO() {
     setDisplayTimer(0);
     setDisplayKills(0);
     setDuelRound(1);
-    setBossRPM(BOSS_RPM);
+    setBossHP(BOSS_HP);
+    setBossMaxHP(BOSS_HP);
     isPausedRef.current = false;
     gameOverRef.current = false;
     setGameId(prev => prev + 1);
@@ -1994,7 +2011,7 @@ export default function GasingIO() {
                         <div
                           className="h-full rounded-full transition-all duration-150"
                           style={{
-                            width: `${(bossRPM / (BOSS_RPM + duelRound * 10)) * 100}%`,
+                            width: `${(bossHP / bossMaxHP) * 100}%`,
                             background: 'linear-gradient(90deg, #ff2266, #ff6688)',
                           }}
                         />
