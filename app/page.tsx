@@ -208,7 +208,21 @@ interface GameState {
   kills: number;
 }
 
-type GameMode = 'battle-royale' | 'survival';
+type GameMode = 'arena' | 'survival' | 'duel';
+
+// Duel mode projectiles
+interface Laser {
+  x: number; y: number;
+  vx: number; vy: number;
+  life: number; // frames remaining
+}
+interface Bomb {
+  x: number; y: number;
+  vx: number; vy: number;
+  timer: number; // frames until explosion
+  exploded: boolean;
+  explodeTimer: number; // frames of explosion visual
+}
 
 // ─── Constants (TUNED FOR FUN!) ──────────────────────────────────
 const CANVAS_W = 1200;
@@ -282,6 +296,24 @@ const BOT_SEPARATION_FORCE = 0.0015;
 const SURVIVAL_SPAWN_INTERVAL = 180; // frames between bot spawns (3 sec at 60fps)
 const SURVIVAL_SAFE_ZONE_SHRINK = 2;  // slower shrink in survival
 
+// Duel mode
+const BOSS_R = 28;                    // boss is bigger
+const BOSS_RPM = 40;                  // boss starting RPM per round (low for fast fights)
+const BOSS_COLOR = '#ff2266';         // boss color
+const DUEL_LASER_SPEED = 8;           // pixels per frame
+const DUEL_LASER_INTERVAL = 12;       // frames between lasers (5/sec)
+const DUEL_BOMB_SPEED = 4;
+const DUEL_BOMB_INTERVAL = 12;        // frames between bombs (5/sec)
+const DUEL_BOMB_EXPLODE_R = 60;       // explosion radius
+const DUEL_BOMB_DMG = 12;             // RPM damage from bomb
+const DUEL_LASER_DMG = 8;             // RPM damage from laser
+const DUEL_COLLISION_MULT = 3;        // collision damage multiplier in duel
+const DUEL_SAFE_ZONE_SHRINK = 4;      // slower shrink for boss fight
+const DUEL_ROUND_TRANSITION_FRAMES = 180; // 3 seconds at 60fps
+const DUEL_PROJECTILE_INVULN = 20;    // invincibility frames after projectile hit (0.33 sec)
+const DUEL_BOSS_SPIN_CHANCE = 0.10;   // boss spins slower than normal bots (10% vs 30%)
+const DUEL_BOSS_SPIN_GAIN = 3;        // half normal gain
+
 const BOT_COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
   '#F7DC6F', '#BB8FCE', '#85C1E2', '#F8B739', '#52B788',
@@ -324,6 +356,16 @@ export default function GasingIO() {
     nextBotSpawnFrame: number;  // for survival mode
     botSpawnIndex: number;      // which bot index to spawn next
     wallBodies: Matter.Body[];  // reference to walls for spawning
+    // Duel mode
+    duelRound: number;
+    duelLasers: Laser[];
+    duelBombs: Bomb[];
+    lastLaserFrame: number;
+    lastBombFrame: number;
+    duelBossMaxRPM: number;
+    duelTransition: boolean;      // true during round transition
+    duelTransitionTimer: number;  // countdown frames
+    lastProjectileHitFrame: number; // for invincibility after projectile hit
   } | null>(null);
 
   const [displayRPM, setDisplayRPM] = useState(STARTING_RPM);
@@ -339,9 +381,11 @@ export default function GasingIO() {
   const isPausedRef = useRef(false);
   const cleanupRef = useRef<(() => void) | null>(null);
   const [gameId, setGameId] = useState(0);
-  const [gameMode, setGameMode] = useState<GameMode>('battle-royale');
+  const [gameMode, setGameMode] = useState<GameMode>('arena');
   const [displayKills, setDisplayKills] = useState(0);
   const gameOverRef = useRef(false);
+  const [duelRound, setDuelRound] = useState(1);
+  const [bossRPM, setBossRPM] = useState(BOSS_RPM);
 
   // ─── Initialize game engine ─────────────────────────────────
   const initGame = useCallback(() => {
@@ -407,7 +451,7 @@ export default function GasingIO() {
 
     // ── Bot bodies (Battle Royale: spawn all, Survival: spawn none) ──
     const bots: Bot[] = [];
-    if (gameMode === 'battle-royale') {
+    if (gameMode === 'arena') {
       for (let i = 0; i < botCount; i++) {
         const angle = (i / botCount) * Math.PI * 2;
         const dist = 180 + Math.random() * 80;
@@ -437,6 +481,29 @@ export default function GasingIO() {
       }
     }
     // Survival mode: bots array starts empty, they'll be spawned in the game loop
+
+    // Duel mode: spawn 1 boss bot on opposite side
+    if (gameMode === 'duel') {
+      const bossBody = Matter.Bodies.circle(CX + 200, CY, BOSS_R, {
+        frictionAir: FRICTION_AIR * 0.7, // boss has less air friction
+        restitution: RESTITUTION,
+        density: DENSITY * 1.5,  // heavier boss
+        label: 'bot_0',
+      });
+      bots.push({
+        body: bossBody,
+        rpm: BOSS_RPM,
+        color: BOSS_COLOR,
+        name: 'BOSS',
+        alive: true,
+        stateTimer: 0,
+        trail: [],
+        wanderAngle: Math.random() * Math.PI * 2,
+        personality: 0.8,
+        lastHitFrame: -999,
+        chainHits: 0,
+      });
+    }
 
     Matter.World.add(engine.world, [
       ...wallBodies,
@@ -507,6 +574,10 @@ export default function GasingIO() {
         // Force = base + RPM scaling + velocity impact
         let force = KNOCKBACK_BASE + attackerRPM * KNOCKBACK_RPM_MULT + relSpeed * VELOCITY_KNOCKBACK;
 
+        // Duel mode: boss spikes = 2x damage and knockback
+        const isDuelBoss = g.gameMode === 'duel' && attacker.label === 'bot_0';
+        if (isDuelBoss) force *= 2;
+
         // Over-spin zone bonus (above SWEET_HIGH)
         if (attackerRPM >= SWEET_HIGH) {
           force *= 1.6;
@@ -530,24 +601,30 @@ export default function GasingIO() {
 
         // ── RPM drain — FLAT 5% + CHAIN BONUS ──
         if (defender.label === 'player') {
-          // Player takes ~10% base + small RPM-diff bonus
-          const playerDrain = 10 + Math.max(0, attackerRPM - defenderRPM) * 0.08;
+          // Duel: boss spikes deal extra damage TO player, but player deals normal damage to boss
+          const duelMult = isDuelBoss ? DUEL_COLLISION_MULT : 1;
+          const playerDrain = (10 + Math.max(0, attackerRPM - defenderRPM) * 0.08) * duelMult;
           g.currentRPM = Math.max(0, g.currentRPM - playerDrain);
         } else {
           const defBot = bots.find((b) => b.body === defender);
           if (defBot) {
-            // Check if this hit is within chain window
             if (g.frameCount - defBot.lastHitFrame < BOT_CHAIN_WINDOW) {
-              // Still in chain — escalate
               defBot.chainHits++;
             } else {
-              // Chain expired — reset
               defBot.chainHits = 1;
             }
             defBot.lastHitFrame = g.frameCount;
 
             // Drain = 5 base + 5 per chain level
-            const chainDrain = 5 + (defBot.chainHits - 1) * 5;
+            let chainDrain = 5 + (defBot.chainHits - 1) * 5;
+
+            // Duel mode: momentum damage — faster player hits = more damage to boss
+            if (g.gameMode === 'duel' && attacker.label === 'player') {
+              const playerSpeed = Math.sqrt(attacker.velocity.x ** 2 + attacker.velocity.y ** 2);
+              const momentumBonus = playerSpeed * 3; // ~0-15 extra RPM drain based on speed
+              chainDrain += momentumBonus;
+            }
+
             defBot.rpm = Math.max(0, defBot.rpm - chainDrain);
           }
         }
@@ -576,15 +653,27 @@ export default function GasingIO() {
       deathParticles: [] as { x: number; y: number; vx: number; vy: number; alpha: number; size: number; color: string }[],
       gameMode,
       kills: 0,
-      nextBotSpawnFrame: SURVIVAL_SPAWN_INTERVAL, // first bot spawns at 3 sec
+      nextBotSpawnFrame: SURVIVAL_SPAWN_INTERVAL,
       botSpawnIndex: 0,
       wallBodies,
+      // Duel
+      duelRound: 1,
+      duelLasers: [] as Laser[],
+      duelBombs: [] as Bomb[],
+      lastLaserFrame: 0,
+      lastBombFrame: 0,
+      duelBossMaxRPM: BOSS_RPM,
+      duelTransition: false,
+      duelTransitionTimer: 0,
+      lastProjectileHitFrame: -999,  // for invincibility frames
     };
     gameRef.current = game;
 
     // ── Keyboard handlers ──
     const onKeyDown = (e: KeyboardEvent) => {
       const k = e.key.toLowerCase();
+      // Block all gameplay input during duel round transition
+      if (game.duelTransition) return;
       if ('wasd'.includes(k) && k.length === 1) game.keys.add(k);
 
       if ((k === 'j' || k === 'k') && game.playerAlive) {
@@ -663,6 +752,15 @@ export default function GasingIO() {
         // Skip physics updates if game is over
         if (isGameOver) continue;
 
+        // Duel: freeze during round transition
+        if (game.duelTransition) {
+          game.duelTransitionTimer--;
+          if (game.duelTransitionTimer <= 0) {
+            game.duelTransition = false;
+          }
+          continue;
+        }
+
         game.frameCount++;
         Matter.Engine.update(engine, FIXED_DT);
 
@@ -708,7 +806,7 @@ export default function GasingIO() {
           game.nextBotSpawnFrame = game.frameCount + SURVIVAL_SPAWN_INTERVAL;
         }
 
-        // ─── Center gravity — BOWL SHAPE (quadratic: stronger toward edges) ───
+        // ─── Center gravity ─── 
         const allBodies = [player, ...bots.filter(b => b.alive).map(b => b.body)];
         for (const body of allBodies) {
           const gdx = CX - body.position.x;
@@ -813,7 +911,7 @@ export default function GasingIO() {
 
         // ─── Safe zone shrink + drift ───
         // Safe zone shrink (slower in survival)
-        const shrinkRate = game.gameMode === 'survival' ? SURVIVAL_SAFE_ZONE_SHRINK : SAFE_ZONE_SHRINK_PER_SEC;
+        const shrinkRate = game.gameMode === 'duel' ? DUEL_SAFE_ZONE_SHRINK : game.gameMode === 'survival' ? SURVIVAL_SAFE_ZONE_SHRINK : SAFE_ZONE_SHRINK_PER_SEC;
         if (game.frameCount % 60 === 0 && game.safeZone > SAFE_ZONE_MIN) {
           game.safeZone = Math.max(SAFE_ZONE_MIN, game.safeZone - shrinkRate);
           setDisplaySafeZone(game.safeZone);
@@ -850,6 +948,49 @@ export default function GasingIO() {
             soundManager.playDeath();
             game.kills++;
             setDisplayKills(game.kills);
+
+            // Duel mode: advance round when boss dies
+            if (game.gameMode === 'duel') {
+              if (game.duelRound < 3) {
+                // Start round transition — freeze physics for 3 seconds
+                game.duelRound++;
+                setDuelRound(game.duelRound);
+                game.duelTransition = true;
+                game.duelTransitionTimer = DUEL_ROUND_TRANSITION_FRAMES;
+
+                // Reset boss
+                bot.alive = true;
+                bot.rpm = BOSS_RPM + game.duelRound * 15; // boss gets significantly stronger
+                game.duelBossMaxRPM = bot.rpm;
+                setBossRPM(bot.rpm);
+                Matter.Body.setPosition(bot.body, { x: CX + 200, y: CY });
+                Matter.Body.setVelocity(bot.body, { x: 0, y: 0 });
+
+                // Reset player position and RPM
+                Matter.Body.setPosition(player, { x: CX - 200, y: CY });
+                Matter.Body.setVelocity(player, { x: 0, y: 0 });
+                game.currentRPM = STARTING_RPM;
+                setDisplayRPM(STARTING_RPM);
+
+                // Reset safe zone
+                game.safeZone = SAFE_ZONE_INITIAL;
+                game.safeZoneCX = CX;
+                game.safeZoneCY = CY;
+                setDisplaySafeZone(SAFE_ZONE_INITIAL);
+
+                // Clear projectiles
+                game.duelLasers = [];
+                game.duelBombs = [];
+
+                // Visual flash
+                spawnDeathParticles(CX, CY, '#ffff00', 30);
+              } else {
+                // All 3 rounds complete — player wins!
+                soundManager.playGameOver(true);
+                gameOverRef.current = true;
+                setGameState({ phase: 'gameover', isWinner: true, playersAlive: 1, kills: game.kills });
+              }
+            }
             continue;
           }
 
@@ -861,13 +1002,13 @@ export default function GasingIO() {
           if (bOutside) botDecay *= OUTSIDE_DECAY_MULT;
           bot.rpm = Math.max(0, bot.rpm - botDecay);
 
-          // Passive regen inside safe zone (1 RPM/sec)
-          if (!bOutside) {
+          // Passive regen inside safe zone (disabled for duel boss)
+          if (!bOutside && game.gameMode !== 'duel') {
             bot.rpm = Math.min(90, bot.rpm + BOT_PASSIVE_REGEN / 60);
           }
 
-          // RPM floor inside safe zone
-          if (!bOutside && bot.rpm < BOT_RPM_FLOOR_INSIDE) {
+          // RPM floor inside safe zone (disabled for duel boss)
+          if (!bOutside && bot.rpm < BOT_RPM_FLOOR_INSIDE && game.gameMode !== 'duel') {
             bot.rpm = BOT_RPM_FLOOR_INSIDE;
           }
 
@@ -876,14 +1017,16 @@ export default function GasingIO() {
             bot.chainHits = 0;
           }
 
-          // Regular spinning
-          if (Math.random() < BOT_SPIN_CHANCE) {
-            const gain = bOutside ? BOT_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_SPIN_GAIN;
+          // Regular spinning (duel boss: slower spin rate)
+          const spinChance = game.gameMode === 'duel' ? DUEL_BOSS_SPIN_CHANCE : BOT_SPIN_CHANCE;
+          const spinGain = game.gameMode === 'duel' ? DUEL_BOSS_SPIN_GAIN : BOT_SPIN_GAIN;
+          if (Math.random() < spinChance) {
+            const gain = bOutside ? spinGain * OUTSIDE_GAIN_MULT : spinGain;
             bot.rpm = Math.min(90, bot.rpm + gain);
           }
 
-          // EMERGENCY SPIN: when RPM is critically low, bots panic-spin extra hard
-          if (bot.rpm < SWEET_LOW && Math.random() < BOT_EMERGENCY_SPIN_CHANCE) {
+          // EMERGENCY SPIN: when RPM is critically low (disabled for duel boss)
+          if (game.gameMode !== 'duel' && bot.rpm < SWEET_LOW && Math.random() < BOT_EMERGENCY_SPIN_CHANCE) {
             const eGain = bOutside ? BOT_EMERGENCY_SPIN_GAIN * OUTSIDE_GAIN_MULT : BOT_EMERGENCY_SPIN_GAIN;
             bot.rpm = Math.min(90, bot.rpm + eGain);
           }
@@ -1080,11 +1223,126 @@ export default function GasingIO() {
           bot.trail.forEach((t) => (t.alpha -= 0.08));
         }
 
+        // ─── Duel Mode: Boss Weapons ───
+        if (game.gameMode === 'duel' && game.playerAlive) {
+          const boss = game.bots[0];
+          if (boss && boss.alive) {
+            setBossRPM(boss.rpm);
+
+            // Round 2+: Fire laser toward player
+            if (game.duelRound >= 2 && game.frameCount - game.lastLaserFrame >= DUEL_LASER_INTERVAL) {
+              game.lastLaserFrame = game.frameCount;
+              const dx = player.position.x - boss.body.position.x;
+              const dy = player.position.y - boss.body.position.y;
+              const d = Math.sqrt(dx * dx + dy * dy) || 1;
+              game.duelLasers.push({
+                x: boss.body.position.x,
+                y: boss.body.position.y,
+                vx: (dx / d) * DUEL_LASER_SPEED,
+                vy: (dy / d) * DUEL_LASER_SPEED,
+                life: 120, // 2 seconds
+              });
+            }
+
+            // Round 3+: Throw bomb toward player
+            if (game.duelRound >= 3 && game.frameCount - game.lastBombFrame >= DUEL_BOMB_INTERVAL) {
+              game.lastBombFrame = game.frameCount;
+              const dx = player.position.x - boss.body.position.x;
+              const dy = player.position.y - boss.body.position.y;
+              const d = Math.sqrt(dx * dx + dy * dy) || 1;
+              game.duelBombs.push({
+                x: boss.body.position.x,
+                y: boss.body.position.y,
+                vx: (dx / d) * DUEL_BOMB_SPEED,
+                vy: (dy / d) * DUEL_BOMB_SPEED,
+                timer: Math.max(30, Math.floor(d / DUEL_BOMB_SPEED)), // explodes when it reaches target area
+                exploded: false,
+                explodeTimer: 0,
+              });
+            }
+          }
+
+          // Update lasers
+          for (let i = game.duelLasers.length - 1; i >= 0; i--) {
+            const laser = game.duelLasers[i];
+            laser.x += laser.vx;
+            laser.y += laser.vy;
+            laser.life--;
+
+            // Check collision with player
+            const ldx = laser.x - player.position.x;
+            const ldy = laser.y - player.position.y;
+            const lDist = Math.sqrt(ldx * ldx + ldy * ldy);
+            if (lDist < PLAYER_R + 6) {
+              // Check invincibility
+              const isInvuln = game.frameCount - game.lastProjectileHitFrame < DUEL_PROJECTILE_INVULN;
+              if (!isInvuln) {
+                game.currentRPM = Math.max(0, game.currentRPM - DUEL_LASER_DMG);
+                Matter.Body.applyForce(player, player.position, {
+                  x: laser.vx * 0.003,
+                  y: laser.vy * 0.003,
+                });
+                game.lastProjectileHitFrame = game.frameCount;
+              }
+              soundManager.playCollision(0.6);
+              spawnDeathParticles(laser.x, laser.y, '#ff0066', 5);
+              game.duelLasers.splice(i, 1);
+              continue;
+            }
+
+            if (laser.life <= 0 || laser.x < 0 || laser.x > CANVAS_W || laser.y < 0 || laser.y > CANVAS_H) {
+              game.duelLasers.splice(i, 1);
+            }
+          }
+
+          // Update bombs
+          for (let i = game.duelBombs.length - 1; i >= 0; i--) {
+            const bomb = game.duelBombs[i];
+            if (!bomb.exploded) {
+              bomb.x += bomb.vx;
+              bomb.y += bomb.vy;
+              bomb.timer--;
+
+              if (bomb.timer <= 0) {
+                // Explode!
+                bomb.exploded = true;
+                bomb.explodeTimer = 20; // show explosion for 20 frames
+                soundManager.playCollision(1.0);
+
+                // Damage player if in radius
+                const bdx = bomb.x - player.position.x;
+                const bdy = bomb.y - player.position.y;
+                const bDist = Math.sqrt(bdx * bdx + bdy * bdy);
+                if (bDist < DUEL_BOMB_EXPLODE_R) {
+                  const isInvuln = game.frameCount - game.lastProjectileHitFrame < DUEL_PROJECTILE_INVULN;
+                  if (!isInvuln) {
+                    const falloff = 1 - (bDist / DUEL_BOMB_EXPLODE_R);
+                    game.currentRPM = Math.max(0, game.currentRPM - DUEL_BOMB_DMG * falloff);
+                    const kx = (player.position.x - bomb.x) / (bDist || 1);
+                    const ky = (player.position.y - bomb.y) / (bDist || 1);
+                    Matter.Body.applyForce(player, player.position, {
+                      x: kx * 0.02 * falloff,
+                      y: ky * 0.02 * falloff,
+                    });
+                    game.lastProjectileHitFrame = game.frameCount;
+                  }
+                }
+                spawnDeathParticles(bomb.x, bomb.y, '#ff8800', 15);
+              }
+            } else {
+              bomb.explodeTimer--;
+              if (bomb.explodeTimer <= 0) {
+                game.duelBombs.splice(i, 1);
+              }
+            }
+          }
+        }
+
         // Update alive count
         const totalAlive = aliveCount + (game.playerAlive ? 1 : 0);
         setGameState((prev) => {
           if (prev.phase !== 'playing') return prev;
-          if (game.gameMode === 'battle-royale' && aliveCount === 0 && game.playerAlive) {
+          if (game.gameMode === 'arena' && aliveCount === 0 && game.playerAlive) {
             soundManager.playGameOver(true);
             gameOverRef.current = true;
             return { phase: 'gameover', isWinner: true, playersAlive: 1, kills: game.kills };
@@ -1352,6 +1610,104 @@ export default function GasingIO() {
         ctx.fillText('YOU', player.position.x, player.position.y - PLAYER_R - 10);
       }
 
+      // ─── Duel Mode: Draw boss spikes, lasers, bombs ───
+      if (game.gameMode === 'duel') {
+        const boss = game.bots[0];
+        if (boss && boss.alive) {
+          // Draw spikes around boss
+          const spikeCount = 8;
+          const spikeLen = 12;
+          ctx.strokeStyle = '#ffcc00';
+          ctx.lineWidth = 3;
+          for (let s = 0; s < spikeCount; s++) {
+            const sa = (game.frameCount * 0.04) + (s / spikeCount) * Math.PI * 2;
+            const x1 = boss.body.position.x + Math.cos(sa) * (BOSS_R + 2);
+            const y1 = boss.body.position.y + Math.sin(sa) * (BOSS_R + 2);
+            const x2 = boss.body.position.x + Math.cos(sa) * (BOSS_R + 2 + spikeLen);
+            const y2 = boss.body.position.y + Math.sin(sa) * (BOSS_R + 2 + spikeLen);
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.stroke();
+          }
+
+          // Boss HP bar above boss
+          const hpW = 50;
+          const hpH = 5;
+          const hpX = boss.body.position.x - hpW / 2;
+          const hpY = boss.body.position.y - BOSS_R - 22;
+          const hpPct = boss.rpm / game.duelBossMaxRPM;
+          ctx.fillStyle = 'rgba(0,0,0,0.6)';
+          ctx.fillRect(hpX, hpY, hpW, hpH);
+          ctx.fillStyle = hpPct > 0.5 ? '#ff2266' : hpPct > 0.25 ? '#ff8800' : '#ff0000';
+          ctx.fillRect(hpX, hpY, hpW * hpPct, hpH);
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(hpX, hpY, hpW, hpH);
+
+          // Round label
+          ctx.fillStyle = '#ffcc00';
+          ctx.font = 'bold 10px "Segoe UI", sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText(`ROUND ${game.duelRound}`, boss.body.position.x, hpY - 5);
+        }
+
+        // Draw lasers
+        for (const laser of game.duelLasers) {
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = '#ff0066';
+          ctx.strokeStyle = '#ff0066';
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.moveTo(laser.x - laser.vx * 3, laser.y - laser.vy * 3); // trail
+          ctx.lineTo(laser.x, laser.y);
+          ctx.stroke();
+          // Bright tip
+          ctx.fillStyle = '#ffffff';
+          ctx.beginPath();
+          ctx.arc(laser.x, laser.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }
+
+        // Draw bombs
+        for (const bomb of game.duelBombs) {
+          if (!bomb.exploded) {
+            // Flying bomb
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = '#ff8800';
+            ctx.fillStyle = '#ff8800';
+            ctx.beginPath();
+            ctx.arc(bomb.x, bomb.y, 7, 0, Math.PI * 2);
+            ctx.fill();
+            // Fuse spark
+            ctx.fillStyle = '#ffff00';
+            ctx.beginPath();
+            ctx.arc(bomb.x - bomb.vx * 0.5, bomb.y - bomb.vy * 0.5, 3, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+          } else {
+            // Explosion
+            const progress = 1 - bomb.explodeTimer / 20;
+            const r = DUEL_BOMB_EXPLODE_R * progress;
+            ctx.globalAlpha = 1 - progress;
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = '#ff4400';
+            ctx.fillStyle = `rgba(255, ${Math.floor(100 + 100 * (1 - progress))}, 0, ${0.6 * (1 - progress)})`;
+            ctx.beginPath();
+            ctx.arc(bomb.x, bomb.y, r, 0, Math.PI * 2);
+            ctx.fill();
+            // Inner bright core
+            ctx.fillStyle = `rgba(255, 255, 200, ${0.8 * (1 - progress)})`;
+            ctx.beginPath();
+            ctx.arc(bomb.x, bomb.y, r * 0.3, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.shadowBlur = 0;
+          }
+        }
+      }
+
       // ─── Death Particles ───
       for (let i = game.deathParticles.length - 1; i >= 0; i--) {
         const p = game.deathParticles[i];
@@ -1379,6 +1735,53 @@ export default function GasingIO() {
       ctx.globalAlpha = 1;
       ctx.shadowBlur = 0;
 
+      // ─── Duel: Round Transition Overlay ───
+      if (game.gameMode === 'duel' && game.duelTransition) {
+        const progress = 1 - game.duelTransitionTimer / DUEL_ROUND_TRANSITION_FRAMES;
+        const countdown = Math.ceil(game.duelTransitionTimer / 60);
+
+        // Dark overlay
+        ctx.fillStyle = `rgba(0, 0, 0, ${0.7 + 0.2 * Math.sin(progress * Math.PI)})`;
+        ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+        // Round number — big text with scale animation
+        const scale = progress < 0.2 ? progress / 0.2 : 1;
+        ctx.save();
+        ctx.translate(CANVAS_W / 2, CANVAS_H / 2 - 40);
+        ctx.scale(scale, scale);
+        ctx.font = 'bold 80px "Segoe UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffcc00';
+        ctx.shadowBlur = 30;
+        ctx.shadowColor = '#ffcc00';
+        ctx.fillText(`ROUND ${game.duelRound}`, 0, 0);
+        ctx.restore();
+
+        // Weapons description
+        ctx.font = 'bold 18px "Segoe UI", sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowBlur = 0;
+        const weapons = game.duelRound === 1 ? '🔱 SPIKES'
+          : game.duelRound === 2 ? '🔱 SPIKES + 🔴 LASER'
+            : '🔱 SPIKES + 🔴 LASER + 💣 BOMBS';
+        ctx.fillText(weapons, CANVAS_W / 2, CANVAS_H / 2 + 20);
+
+        // Countdown
+        ctx.font = 'bold 36px "Segoe UI", sans-serif';
+        ctx.fillStyle = countdown <= 1 ? '#00ff88' : '#ffffff';
+        ctx.shadowBlur = countdown <= 1 ? 20 : 0;
+        ctx.shadowColor = '#00ff88';
+        const countdownText = countdown <= 0 ? 'FIGHT!' : `${countdown}`;
+        ctx.fillText(countdownText, CANVAS_W / 2, CANVAS_H / 2 + 80);
+        ctx.shadowBlur = 0;
+
+        // VS indicator
+        ctx.font = 'bold 14px "Segoe UI", sans-serif';
+        ctx.fillStyle = '#888888';
+        ctx.fillText('YOU  VS  BOSS', CANVAS_W / 2, CANVAS_H / 2 + 110);
+      }
+
       game.animId = requestAnimationFrame(tick);
     };
 
@@ -1403,12 +1806,14 @@ export default function GasingIO() {
       cleanupRef.current = null;
     }
     gameRef.current = null;
-    const initialAlive = gameMode === 'battle-royale' ? botCount + 1 : 1; // Only player is alive initially in survival
+    const initialAlive = gameMode === 'arena' ? botCount + 1 : gameMode === 'duel' ? 2 : 1;
     setGameState({ phase: 'playing', isWinner: false, playersAlive: initialAlive, kills: 0 });
     setDisplayRPM(STARTING_RPM);
     setDisplaySafeZone(SAFE_ZONE_INITIAL);
     setDisplayTimer(0);
     setDisplayKills(0);
+    setDuelRound(1);
+    setBossRPM(BOSS_RPM);
     isPausedRef.current = false;
     gameOverRef.current = false;
     setGameId(prev => prev + 1);
@@ -1574,10 +1979,29 @@ export default function GasingIO() {
               </div>
             </div>
 
-            {/* Alive counter / Survival stats */}
+            {/* Alive counter / Survival stats / Duel stats */}
             <div className="absolute top-4 right-4 pointer-events-none">
               <div className="bg-black/80 backdrop-blur rounded-lg p-4" style={{ border: '1px solid rgba(234, 179, 8, 0.3)' }}>
-                {gameMode === 'survival' ? (
+                {gameMode === 'duel' ? (
+                  <>
+                    <div className="text-gray-400 text-xs font-bold tracking-widest mb-1">ROUND</div>
+                    <div className="text-4xl font-bold text-red-400 font-mono">
+                      {duelRound}<span className="text-lg text-gray-500">/3</span>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-gray-400 text-[10px] font-bold tracking-widest mb-1">BOSS HP</div>
+                      <div className="w-28 h-3 bg-gray-900 rounded-full overflow-hidden">
+                        <div
+                          className="h-full rounded-full transition-all duration-150"
+                          style={{
+                            width: `${(bossRPM / (BOSS_RPM + duelRound * 10)) * 100}%`,
+                            background: 'linear-gradient(90deg, #ff2266, #ff6688)',
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </>
+                ) : gameMode === 'survival' ? (
                   <>
                     <div className="text-gray-400 text-xs font-bold tracking-widest mb-1">KILLS</div>
                     <div className="text-4xl font-bold text-red-400 font-mono">
@@ -1673,13 +2097,13 @@ export default function GasingIO() {
               {/* Mode Selection */}
               <div className="flex gap-4 mb-8">
                 <button
-                  onClick={() => setGameMode('battle-royale')}
-                  className={`flex-1 rounded-xl p-5 text-left transition-all hover:scale-[1.02] ${gameMode === 'battle-royale' ? 'ring-2 ring-purple-400 bg-purple-900/40' : 'bg-white/5 hover:bg-white/10'
+                  onClick={() => setGameMode('arena')}
+                  className={`flex-1 rounded-xl p-5 text-left transition-all hover:scale-[1.02] ${gameMode === 'arena' ? 'ring-2 ring-purple-400 bg-purple-900/40' : 'bg-white/5 hover:bg-white/10'
                     }`}
                 >
                   <div className="text-2xl mb-1">⚔️</div>
-                  <div className="text-white font-bold text-lg">Battle Royale</div>
-                  <div className="text-gray-400 text-xs mt-1">Last gasing standing wins! All bots spawn at once.</div>
+                  <div className="text-white font-bold text-lg">Arena</div>
+                  <div className="text-gray-400 text-xs mt-1">Last gasing standing wins!</div>
                 </button>
                 <button
                   onClick={() => setGameMode('survival')}
@@ -1688,7 +2112,16 @@ export default function GasingIO() {
                 >
                   <div className="text-2xl mb-1">🛡️</div>
                   <div className="text-white font-bold text-lg">Survival</div>
-                  <div className="text-gray-400 text-xs mt-1">Bots enter one by one from holes. Survive as long as you can!</div>
+                  <div className="text-gray-400 text-xs mt-1">Endless waves of bots!</div>
+                </button>
+                <button
+                  onClick={() => setGameMode('duel')}
+                  className={`flex-1 rounded-xl p-5 text-left transition-all hover:scale-[1.02] ${gameMode === 'duel' ? 'ring-2 ring-yellow-400 bg-yellow-900/40' : 'bg-white/5 hover:bg-white/10'
+                    }`}
+                >
+                  <div className="text-2xl mb-1">👑</div>
+                  <div className="text-white font-bold text-lg">Duel</div>
+                  <div className="text-gray-400 text-xs mt-1">1v1 boss fight with 3 rounds!</div>
                 </button>
               </div>
 
@@ -1731,7 +2164,7 @@ export default function GasingIO() {
               </div>
 
               {/* Bot count selector (Battle Royale only) */}
-              {gameMode === 'battle-royale' && (
+              {gameMode === 'arena' && (
                 <div className="bg-white/5 rounded-xl p-4 mb-8">
                   <div className="text-sm font-bold text-purple-300 mb-3">⚙️ Settings</div>
                   <div className="flex items-center justify-between">
@@ -1760,21 +2193,27 @@ export default function GasingIO() {
                 onClick={startGame}
                 className="px-14 py-4 rounded-full text-white font-bold text-xl transition-all hover:scale-105 active:scale-95"
                 style={{
-                  background: gameMode === 'survival'
-                    ? 'linear-gradient(135deg, #e74c3c, #f39c12)'
-                    : 'linear-gradient(135deg, #7c3aed, #ec4899)',
-                  boxShadow: gameMode === 'survival'
-                    ? '0 0 30px rgba(231, 76, 60, 0.4)'
-                    : '0 0 30px rgba(124, 58, 237, 0.4)',
+                  background: gameMode === 'duel'
+                    ? 'linear-gradient(135deg, #f39c12, #e74c3c)'
+                    : gameMode === 'survival'
+                      ? 'linear-gradient(135deg, #e74c3c, #f39c12)'
+                      : 'linear-gradient(135deg, #7c3aed, #ec4899)',
+                  boxShadow: gameMode === 'duel'
+                    ? '0 0 30px rgba(243, 156, 18, 0.4)'
+                    : gameMode === 'survival'
+                      ? '0 0 30px rgba(231, 76, 60, 0.4)'
+                      : '0 0 30px rgba(124, 58, 237, 0.4)',
                 }}
               >
-                {gameMode === 'survival' ? '🛡️ START SURVIVAL 🛡️' : '🌀 START BATTLE 🌀'}
+                {gameMode === 'duel' ? '👑 START DUEL 👑' : gameMode === 'survival' ? '🛡️ START SURVIVAL 🛡️' : '🌀 START ARENA 🌀'}
               </button>
 
               <p className="text-gray-600 text-xs mt-4">
-                {gameMode === 'survival'
-                  ? 'Survive endless waves of bots entering from the holes!'
-                  : `Battle against ${botCount} AI opponent${botCount !== 1 ? 's' : ''} in a shrinking arena`}
+                {gameMode === 'duel'
+                  ? 'Face a boss with spikes, lasers, and bombs across 3 rounds!'
+                  : gameMode === 'survival'
+                    ? 'Survive endless waves of bots entering from the holes!'
+                    : `Battle against ${botCount} AI opponent${botCount !== 1 ? 's' : ''} in a shrinking arena`}
               </p>
             </div>
           </div>
@@ -1787,7 +2226,27 @@ export default function GasingIO() {
               <h1 className={`text-6xl font-black mb-3 ${gameState.isWinner ? 'text-yellow-400' : 'text-red-500'}`}>
                 {gameState.isWinner ? '🏆 VICTORY! 🏆' : '💀 KNOCKED OUT 💀'}
               </h1>
-              {gameMode === 'survival' ? (
+              {gameMode === 'duel' ? (
+                <div className="mb-8">
+                  <p className="text-gray-300 text-xl mb-4">
+                    {gameState.isWinner
+                      ? 'You defeated the boss across all 3 rounds!'
+                      : `Defeated on Round ${duelRound} of 3`}
+                  </p>
+                  <div className="flex gap-6 justify-center">
+                    <div className="bg-white/10 rounded-xl p-4">
+                      <div className="text-yellow-400 text-3xl font-bold font-mono">{duelRound}/3</div>
+                      <div className="text-gray-500 text-xs font-bold tracking-widest">ROUNDS</div>
+                    </div>
+                    <div className="bg-white/10 rounded-xl p-4">
+                      <div className="text-cyan-400 text-3xl font-bold font-mono">
+                        {String(Math.floor(displayTimer / 60)).padStart(2, '0')}:{String(displayTimer % 60).padStart(2, '0')}
+                      </div>
+                      <div className="text-gray-500 text-xs font-bold tracking-widest">TIME</div>
+                    </div>
+                  </div>
+                </div>
+              ) : gameMode === 'survival' ? (
                 <div className="mb-8">
                   <p className="text-gray-300 text-xl mb-4">Your gasing stopped spinning...</p>
                   <div className="flex gap-6 justify-center">

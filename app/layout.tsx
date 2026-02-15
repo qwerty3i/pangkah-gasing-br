@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Gasing.io - Spinning Top Battle Arena",
-  description: "Battle royale and survival spinning top game. Be the last gasing standing!",
+  description: "Arena, survival, and duel spinning top game. Be the last gasing standing!",
 };
 
 export default function RootLayout({
