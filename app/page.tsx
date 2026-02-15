@@ -298,7 +298,7 @@ const SURVIVAL_SAFE_ZONE_SHRINK = 2;  // slower shrink in survival
 
 // Duel mode
 const BOSS_R = 28;                    // boss is bigger
-const BOSS_RPM = 40;                  // boss starting RPM per round (low for fast fights)
+const BOSS_RPM = 1000;                  // boss starting RPM (tankier)
 const BOSS_COLOR = '#ff2266';         // boss color
 const DUEL_LASER_SPEED = 8;           // pixels per frame
 const DUEL_LASER_INTERVAL = 12;       // frames between lasers (5/sec)
@@ -306,13 +306,13 @@ const DUEL_BOMB_SPEED = 4;
 const DUEL_BOMB_INTERVAL = 12;        // frames between bombs (5/sec)
 const DUEL_BOMB_EXPLODE_R = 60;       // explosion radius
 const DUEL_BOMB_DMG = 12;             // RPM damage from bomb
-const DUEL_LASER_DMG = 8;             // RPM damage from laser
+const DUEL_LASER_DMG = 4;             // RPM damage from laser (reduced)
 const DUEL_COLLISION_MULT = 3;        // collision damage multiplier in duel
 const DUEL_SAFE_ZONE_SHRINK = 4;      // slower shrink for boss fight
 const DUEL_ROUND_TRANSITION_FRAMES = 180; // 3 seconds at 60fps
 const DUEL_PROJECTILE_INVULN = 20;    // invincibility frames after projectile hit (0.33 sec)
-const DUEL_BOSS_SPIN_CHANCE = 0.10;   // boss spins slower than normal bots (10% vs 30%)
-const DUEL_BOSS_SPIN_GAIN = 3;        // half normal gain
+const DUEL_BOSS_SPIN_CHANCE = 0.05;   // boss spins much slower (5% vs 30%)
+const DUEL_BOSS_SPIN_GAIN = 2;        // small regen per spin
 
 const BOT_COLORS = [
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8',
@@ -621,7 +621,7 @@ export default function GasingIO() {
             // Duel mode: momentum damage — faster player hits = more damage to boss
             if (g.gameMode === 'duel' && attacker.label === 'player') {
               const playerSpeed = Math.sqrt(attacker.velocity.x ** 2 + attacker.velocity.y ** 2);
-              const momentumBonus = playerSpeed * 3; // ~0-15 extra RPM drain based on speed
+              const momentumBonus = playerSpeed * 2; // ~0-10 extra RPM drain based on speed
               chainDrain += momentumBonus;
             }
 
